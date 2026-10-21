@@ -123,7 +123,9 @@ jobs:
           BASE: ${{ steps.range.outputs.base }}
         run: |
           set -euo pipefail
-          args=(git file://. --only-verified --json --no-update)
+          # --branch HEAD: checkout with fetch-depth 0 brings every branch, and trufflehog scans
+          # all of them by default — a PR would then "find" other branches' history.
+          args=(git file://. --branch HEAD --only-verified --json --no-update)
           [ -n "$BASE" ] && args+=(--since-commit "$BASE")
           trufflehog "${args[@]}" > reports/trufflehog.raw.json
           # Never let a secret value reach an artifact.
