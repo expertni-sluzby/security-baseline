@@ -143,6 +143,18 @@ marketplace with one command.
 5. On this repo (free because public): secret scanning, push protection, CodeQL, Scorecard.
 6. Versioning: semver; release notes per tag; a rule change that can newly fail consumers'
    builds is a minor bump announced in advance, a contract change (§5) is a major bump.
+7. Release provenance: release artifacts (probe binary, kit packages, container image) carry
+   GitHub artifact attestations (`actions/attest`; available on Team because this repo is
+   public); consumers verify with `gh attestation verify`.
+
+**Applied 2026-10-20:** CODEOWNERS; rulesets `main-protection` (PR + code-owner review, no
+force-push/deletion; admin may merge own PR, never push directly), `release-tags-immutable`
+(`v*` cannot be updated or deleted — no bypass), `release-tags-creation` (only admins create
+`v*`); secret scanning + push protection + validity checks; Dependabot alerts and security
+updates; default `GITHUB_TOKEN` read-only; Actions on PRs from all external contributors need
+approval. **Not yet:** required signed commits (enable once maintainers sign); tag creation by
+the release workflow (GitHub does not allow the built-in Actions integration as a ruleset
+bypass actor — needs an org-installed GitHub App; until then an admin tags releases).
 
 ## 7. Layer details
 
@@ -156,6 +168,7 @@ marketplace with one command.
 | IaC / images | Trivy `fs` + `config` (Dockerfile, Helm, k8s manifests) + `image` on built images — all stacks |||
 | SBOM | CycloneDX generated per build — all stacks |||
 | Repo hygiene | OpenSSF Scorecard (public repos free; private needs GitHub Code Security) |||
+| CI workflows themselves | **zizmor** on `.github/workflows/**` (template injection, unpinned actions, excessive permissions, persisted checkout credentials, `pull_request_target`) + **Harden-Runner** (egress audit → block allowlist) on every baseline job — all repos, including this one |||
 
 GitHub-native extras for private consumer repos (push protection, CodeQL) need the paid GitHub
 Secret Protection / Code Security add-ons on the Team plan — **verify current pricing before
@@ -207,8 +220,19 @@ with an explicit per-product opt-in. Never writes; the two identities are dedica
 ### 7.4 L4 — AI review
 
 - **PR:** `anthropics/claude-code-security-review` with the consumer's `invariantsFile` and ASVS
-  profile as custom instructions. Advisory (comments), never a hard gate. PRs from forks require
-  maintainer approval before it runs (the action is not hardened against prompt injection).
+  profile as custom instructions. Advisory (comments), never a hard gate.
+- **The AI job is itself an attack surface.** In 2026, prompt injection via PR titles, issue
+  bodies and comments was shown to make AI review agents in CI — this action included
+  (CVE-2026-54316) — leak workflow secrets. The PR review therefore runs under these
+  constraints, enforced in `baseline.yml`, not left to consumers:
+  1. trigger `pull_request` only — never `pull_request_target`, `issue_comment`, `issues`;
+  2. the AI job holds exactly one secret (the Anthropic key, a dedicated low-limit key per
+     organization) and a read-only `GITHUB_TOKEN`; no DefectDojo token, no deploy credentials;
+  3. it writes its findings to an artifact; a separate, non-AI job with
+     `pull-requests: write` posts them — the model never holds a write token;
+  4. Harden-Runner egress in **block** mode with an allowlist (Anthropic API, GitHub API);
+  5. fork PRs need maintainer approval (org setting); the action is pinned by SHA and its
+     security advisories are tracked — a fix is adopted within the High SLA (§8).
 - **Scheduled full-repo audit (monthly, and after any security incident):** class-driven —
   inventory → one hunter per class (classes = ASVS chapters in the profile) → independent
   adversarial verification → DefectDojo. Models: inventory Sonnet 5.5; hunt and verification
@@ -242,6 +266,19 @@ Every finding, whatever found it:
 
 SLA by severity (proposal): Critical 24 h, High 7 days, Medium 30 days, Low 90 days.
 
+A leaked secret is never "fixed" by deleting it from the code: rotate first, then purge, then
+check the provider's access logs for use during the exposure window.
+
+## 8a. Governance around the tooling
+
+| Practice | Content |
+|---|---|
+| **NIST SSDF (SP 800-218)** as the process frame | Map each layer to SSDF practices (PO / PS / PW / RV) once; DefectDojo + the consumer profiles become the SOC 2 / ISO 27001 evidence for secure development (ISO 27001:2022 A.8.25–A.8.31). Build the mapping from the NIST text, not vendor crosswalks. |
+| **Security champions** | One developer per team (roughly 1 per 8–12 developers), ~10–20 % time: owns the team's profile, triages its DefectDojo findings, runs the variant hunt (§8 step 2). Not a substitute for a security review of high-risk changes. |
+| **Lightweight threat modeling** | Mandatory for a new service, a new trust boundary (new client type, agent, external integration) or a new tenant-crossing feature: a one-page STRIDE note (OWASP Threat Dragon or markdown) in the consumer repo, reviewed by the champion. |
+| **External pentest** | Yearly per product (WSTG-based), plus after a major architecture change; results into DefectDojo. Required anyway for SOC 2 / ISO 27001 evidence. |
+| **SAMM** | Yearly self-assessment per team (§3); the scores drive the next year's rollout priorities. |
+
 ## 9. DefectDojo — self-hosted (decided 2026-10-20)
 
 DefectDojo will hold every organization's open vulnerabilities — it is the most sensitive system
@@ -249,7 +286,8 @@ in this design and is treated as such.
 
 | Item | Decision |
 |---|---|
-| Deployment | official Helm chart (start: docker compose for phase 0), managed PostgreSQL with backups and a tested restore |
+| Deployment | our own Kubernetes cluster, official Helm chart; PostgreSQL with backups and a tested restore. The URL reaches consumers as the org-level Actions variable `DEFECTDOJO_URL` — never hard-coded in this public repo |
+| Cluster bar | the cluster hosting DefectDojo must meet production controls (restricted admin access, backups, monitoring, patching) — it stores every organization's open vulnerabilities, so a test-grade cluster is not acceptable |
 | Human access | SSO only, behind VPN / identity-aware proxy; never an open login page on the internet |
 | CI access | GitHub-hosted runners need to reach the API. Expose **only** `/api/v2/` import endpoints through a separate ingress with token auth (+ an identity-aware proxy service token or mTLS); the UI stays private. Alternative: self-hosted runners inside the network — **open decision** |
 | Hierarchy | Product Type = GitHub organization · Product = repo/service · Engagement = CI/CD (one long-lived per branch) |
@@ -290,8 +328,9 @@ docs/                   PLAN.md (this), decisions/
 ## 12. Open decisions
 
 1. ~~Distribution~~ — public repo (§6).
-2. ~~DefectDojo hosting~~ — self-hosted (§9). Still open: where it runs, and CI reachability
-   (public import-only ingress vs self-hosted runners).
+2. ~~DefectDojo hosting~~ — self-hosted on our own cluster (§9). Still open: CI reachability
+   (public import-only ingress vs self-hosted runners); confirm the cluster meets the §9 bar.
+5. GitHub App for the release workflow (tag creation, §6).
 3. Licensing GitHub Secret Protection / Code Security for private consumer repos (optional).
 4. SLA values in §8.
 
@@ -306,3 +345,9 @@ docs/                   PLAN.md (this), decisions/
 - Gitleaks vs TruffleHog — https://www.jit.io/blog/trufflehog-vs-gitleaks-a-detailed-comparison-of-secret-scanning-tools
 - ZAP API scanning — https://qaskills.sh/blog/owasp-zap-api-security-testing-guide-2026
 - Broken access control in CI — https://www.wiz.io/api/md/academy/application-security/broken-access-control
+- AI coding agents in CI, prompt injection → secrets — https://labs.cloudsecurityalliance.org/research/csa-research-note-ai-coding-agent-ci-prompt-injection-202608/
+- zizmor at scale (Grafana) — https://grafana.com/blog/2025/06/25/how-to-detect-vulnerable-github-actions-at-scale-with-zizmor/
+- StepSecurity Harden-Runner / secure workflow — https://docs.stepsecurity.io/orchestrate-security/secure-workflow
+- GitHub artifact attestations — https://docs.github.com/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds
+- NIST SSDF — https://www.nist.gov/document/eo-14028-presentation-nist-secure-software-development-framework-ssdf
+- Security champions — https://appsecsanta.com/application-security/security-champions-guide
