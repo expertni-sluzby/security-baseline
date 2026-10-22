@@ -1,0 +1,21 @@
+# This repo is its own first consumer: every change to baseline.yml runs baseline.yml,
+# enforced, against this repo (zizmor audits the workflows that every consumer trusts).
+name: self-test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  baseline:
+    uses: ./.github/workflows/baseline.yml
+    permissions:
+      contents: read
+    with:
+      enforce: true

@@ -1,0 +1,459 @@
+# L1 baseline scanners (docs/PLAN.md §7.1) as a reusable workflow.
+#
+# Consumers call it with explicit secrets (never `secrets: inherit`):
+#
+#   jobs:
+#     baseline:
+#       uses: expertni-sluzby/security-baseline/.github/workflows/baseline.yml@v1
+#       with:
+#         defectdojo-url: ${{ vars.DEFECTDOJO_URL }}
+#       secrets:
+#         DEFECTDOJO_TOKEN: ${{ secrets.DEFECTDOJO_TOKEN }}
+#
+# Supply chain: every scanner is a release binary (or image) pinned by version AND sha256,
+# every action is pinned by commit SHA, and versions are at least 14 days old when pinned.
+# No third-party scanner actions — tags of those have been hijacked before (trivy-action, 2026).
+# Nothing from `${{ }}` is interpolated into a `run:` script; values travel through `env:`.
+# Reports are uploaded as artifacts, which are PUBLIC on public repos: secret scanners run
+# with redaction, and nothing writes a secret value into a report.
+name: baseline
+
+on:
+  workflow_call:
+    inputs:
+      product:
+        description: "DefectDojo product name (default: the repository name)"
+        type: string
+        default: ""
+      product-type:
+        description: "DefectDojo product type (default: the repository owner or organization)"
+        type: string
+        default: ""
+      defectdojo-url:
+        description: "DefectDojo base URL; pass vars.DEFECTDOJO_URL. Empty means no upload."
+        type: string
+        default: ""
+      enforce:
+        description: >-
+          Fail on dependency / IaC / SAST / workflow findings at or above fail-on.
+          Secrets always fail a pull_request or push run, whatever this says.
+        type: boolean
+        default: false
+      fail-on:
+        description: "Lowest severity that blocks when enforce is on: high or critical"
+        type: string
+        default: high
+    secrets:
+      DEFECTDOJO_TOKEN:
+        required: false
+
+permissions: {}
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  TRUFFLEHOG_VERSION: 3.99.0
+  TRUFFLEHOG_SHA256: e35ae3fd1e4b7a0c1699d0fda1814282bf906d03379bd4337b092b3a84c6740b
+  OSV_SCANNER_VERSION: 2.6.0
+  OSV_SCANNER_SHA256: ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
+  TRIVY_VERSION: 0.75.0
+  TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+  SEMGREP_IMAGE: semgrep/semgrep:1.179.0@sha256:93963d9295a366f59e4850127b1550400ee7b388f04fe144e4a1f6325d96e01b
+  ZIZMOR_VERSION: 1.30.1
+  ZIZMOR_SHA256: eee12266b793cb87ad4a7e3af2e72404f8a63e3de5eb099b80bf7b1cfd232a8e
+
+jobs:
+  secrets:
+    name: secrets (gitleaks + trufflehog)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      blocking: ${{ steps.verdict.outputs.blocking }}
+    steps:
+      - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks and trufflehog (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o gl.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gl.tgz" | sha256sum -c -
+          curl -fsSL -o th.tgz "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz"
+          echo "${TRUFFLEHOG_SHA256}  th.tgz" | sha256sum -c -
+          tar -xzf gl.tgz -C "$RUNNER_TEMP/bin" gitleaks
+          tar -xzf th.tgz -C "$RUNNER_TEMP/bin" trufflehog
+          rm gl.tgz th.tgz
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Resolve the commit range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # Pull requests and pushes scan only the new commits (new leaks block);
+          # scheduled / manual runs scan the full history (reported, see the gate).
+          base=""
+          if [ "$EVENT" = pull_request ]; then base="$PR_BASE"
+          elif [ "$EVENT" = push ] && [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ]; then base="$PUSH_BEFORE"
+          fi
+          if [ -n "$base" ] && ! git cat-file -e "$base^{commit}" 2>/dev/null; then base=""; fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "Scanning ${base:+$base..}HEAD"
+      - name: gitleaks
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          opts="--no-merges"
+          [ -n "$BASE" ] && opts="--no-merges $BASE..HEAD"
+          gitleaks git --log-opts="$opts" --redact --no-banner --exit-code 0 \
+            --report-format json --report-path reports/gitleaks.json .
+      - name: trufflehog (verified secrets only)
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+        run: |
+          set -euo pipefail
+          # --branch HEAD: checkout with fetch-depth 0 brings every branch, and trufflehog scans
+          # all of them by default — a PR would then "find" other branches' history.
+          args=(git file://. --branch HEAD --only-verified --json --no-update)
+          [ -n "$BASE" ] && args+=(--since-commit "$BASE")
+          trufflehog "${args[@]}" > reports/trufflehog.raw.json
+          # Never let a secret value reach an artifact.
+          jq -c '.Raw = "[redacted]" | .RawV2 = "[redacted]"' reports/trufflehog.raw.json > reports/trufflehog.json
+          rm reports/trufflehog.raw.json
+      - id: verdict
+        name: Verdict
+        run: |
+          set -euo pipefail
+          gl=$(jq 'length' reports/gitleaks.json)
+          th=$(grep -c . reports/trufflehog.json || true)
+          echo "blocking=$((gl + th))" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Secrets"
+            echo "| scanner | findings |"
+            echo "|---|---|"
+            echo "| gitleaks | $gl |"
+            echo "| trufflehog (verified) | $th |"
+            jq -r '.[] | "- gitleaks `\(.RuleID)` in `\(.File):\(.StartLine)` (commit \(.Commit[0:8]))"' reports/gitleaks.json | head -50
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: baseline-secrets
+          path: reports/
+          retention-days: 7
+
+  dependencies:
+    name: dependencies (osv-scanner)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      blocking: ${{ steps.verdict.outputs.blocking }}
+    steps:
+      - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install osv-scanner (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/osv-scanner" "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $RUNNER_TEMP/bin/osv-scanner" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/osv-scanner"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: osv-scanner
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          set +e
+          osv-scanner scan source --recursive --format json --output-file reports/osv.json .
+          rc=$?
+          set -e
+          # 0 = clean, 1 = vulnerabilities found, 128 = no lockfiles; anything else is a crash.
+          case "$rc" in
+            0|1) ;;
+            128) echo '{"results":[]}' > reports/osv.json; echo "No lockfiles found." ;;
+            *) echo "osv-scanner failed with exit code $rc"; exit "$rc" ;;
+          esac
+      - id: verdict
+        name: Verdict
+        env:
+          FAIL_ON: ${{ inputs.fail-on }}
+        run: |
+          set -euo pipefail
+          min=7.0; [ "$FAIL_ON" = critical ] && min=9.0
+          n=$(jq --argjson min "$min" '[.results[]?.packages[]?.groups[]?.max_severity | tonumber? | select(. >= $min)] | length' reports/osv.json)
+          total=$(jq '[.results[]?.packages[]?.groups[]?] | length' reports/osv.json)
+          echo "blocking=$n" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Dependencies"
+            echo "$total vulnerability groups, $n at or above CVSS $min."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: baseline-dependencies
+          path: reports/
+          retention-days: 7
+
+  iac:
+    name: iac (trivy config)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      blocking: ${{ steps.verdict.outputs.blocking }}
+    steps:
+      - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install trivy (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz -C "$RUNNER_TEMP/bin" trivy
+          rm trivy.tgz
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: trivy config (Dockerfile, Helm, Kubernetes, Terraform)
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          trivy config --quiet --format json --output reports/trivy-config.json --exit-code 0 .
+      - id: verdict
+        name: Verdict
+        env:
+          FAIL_ON: ${{ inputs.fail-on }}
+        run: |
+          set -euo pipefail
+          sev='["HIGH","CRITICAL"]'; [ "$FAIL_ON" = critical ] && sev='["CRITICAL"]'
+          n=$(jq --argjson sev "$sev" '[.Results[]?.Misconfigurations[]? | select(.Status != "PASS") | select(.Severity as $s | $sev | index($s))] | length' reports/trivy-config.json)
+          total=$(jq '[.Results[]?.Misconfigurations[]? | select(.Status != "PASS")] | length' reports/trivy-config.json)
+          echo "blocking=$n" >> "$GITHUB_OUTPUT"
+          {
+            echo "### IaC"
+            echo "$total misconfigurations, $n at or above $FAIL_ON."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: baseline-iac
+          path: reports/
+          retention-days: 7
+
+  sast:
+    name: sast (semgrep)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      blocking: ${{ steps.verdict.outputs.blocking }}
+    steps:
+      - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: semgrep (pinned image digest, metrics off)
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan --config p/default --metrics off --disable-version-check \
+            --json --output reports/semgrep.json .
+      - id: verdict
+        name: Verdict
+        env:
+          FAIL_ON: ${{ inputs.fail-on }}
+        run: |
+          set -euo pipefail
+          # Rules use either ERROR/WARNING/INFO or LOW..CRITICAL; ERROR counts as high.
+          sev='["ERROR","HIGH","CRITICAL"]'; [ "$FAIL_ON" = critical ] && sev='["CRITICAL"]'
+          n=$(jq --argjson sev "$sev" '[.results[] | select(.extra.severity as $s | $sev | index($s))] | length' reports/semgrep.json)
+          total=$(jq '.results | length' reports/semgrep.json)
+          errors=$(jq '.errors | length' reports/semgrep.json)
+          echo "blocking=$n" >> "$GITHUB_OUTPUT"
+          {
+            echo "### SAST"
+            echo "$total results, $n at or above $FAIL_ON ($errors scan errors)."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: baseline-sast
+          path: reports/
+          retention-days: 7
+
+  workflows:
+    name: workflows (zizmor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      blocking: ${{ steps.verdict.outputs.blocking }}
+    steps:
+      - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install zizmor (pinned wheel, hash-verified)
+        run: |
+          set -euo pipefail
+          echo "zizmor==${ZIZMOR_VERSION} --hash=sha256:${ZIZMOR_SHA256}" > "$RUNNER_TEMP/zizmor-req.txt"
+          python3 -m venv "$RUNNER_TEMP/zizmor"
+          "$RUNNER_TEMP/zizmor/bin/pip" install --quiet --only-binary :all: --require-hashes -r "$RUNNER_TEMP/zizmor-req.txt"
+          echo "$RUNNER_TEMP/zizmor/bin" >> "$GITHUB_PATH"
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          if [ ! -d .github ]; then
+            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"zizmor"}},"results":[]}]}' > reports/zizmor.sarif
+            exit 0
+          fi
+          set +e
+          zizmor --format sarif --no-progress . > reports/zizmor.sarif
+          rc=$?
+          set -e
+          # zizmor exits non-zero when it reports findings (10-14); only a crash (other codes) fails here.
+          case "$rc" in 0|1[0-4]) ;; *) echo "zizmor failed with exit code $rc"; exit "$rc" ;; esac
+      - id: verdict
+        name: Verdict
+        run: |
+          set -euo pipefail
+          n=$(jq '[.runs[].results[] | select(.level == "error")] | length' reports/zizmor.sarif)
+          total=$(jq '[.runs[].results[]] | length' reports/zizmor.sarif)
+          echo "blocking=$n" >> "$GITHUB_OUTPUT"
+          {
+            echo "### CI workflows"
+            echo "$total findings, $n high."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: baseline-workflows
+          path: reports/
+          retention-days: 7
+
+  defectdojo:
+    name: upload to DefectDojo
+    # Only reviewed code reaches the findings store: pushes, scheduled and manual runs.
+    # Pull requests are gated in CI but not recorded (fork PRs carry no secrets anyway).
+    if: ${{ always() && github.event_name != 'pull_request' && inputs.defectdojo-url != '' }}
+    needs: [secrets, dependencies, iac, sast, workflows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: audit
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: baseline-*
+          path: reports
+          merge-multiple: true
+      - name: reimport-scan
+        env:
+          DD_URL: ${{ inputs.defectdojo-url }}
+          DD_TOKEN: ${{ secrets.DEFECTDOJO_TOKEN }}
+          PRODUCT: ${{ inputs.product }}
+          PRODUCT_TYPE: ${{ inputs.product-type }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DD_TOKEN" ]; then
+            echo "::warning::defectdojo-url is set but DEFECTDOJO_TOKEN was not passed; nothing uploaded."
+            exit 0
+          fi
+          product="${PRODUCT:-${REPO#*/}}"
+          ptype="${PRODUCT_TYPE:-$OWNER}"
+          failed=0
+          upload() { # <file> <scan type> <test title>
+            [ -s "reports/$1" ] || { echo "skip $1 (missing)"; return 0; }
+            # The token goes through curl's config on stdin, never the command line.
+            code=$(printf 'header = "Authorization: Token %s"\n' "$DD_TOKEN" | curl -sS -K - \
+              -o /tmp/dd-resp.json -w '%{http_code}' "${DD_URL%/}/api/v2/reimport-scan/" \
+              -F "scan_type=$2" -F "test_title=$3" -F "file=@reports/$1" \
+              -F auto_create_context=true -F "product_type_name=$ptype" -F "product_name=$product" \
+              -F "engagement_name=ci/$REF_NAME" -F deduplication_on_engagement=true \
+              -F close_old_findings=true -F active=true -F verified=false -F minimum_severity=Info \
+              -F "version=$SHA" -F "commit_hash=$SHA" -F "branch_tag=$REF_NAME" \
+              -F "build_id=$RUN_URL" -F "source_code_management_uri=$REPO_URL") || code=000
+            if [ "$code" = 201 ]; then echo "uploaded $1 ($3)"
+            else echo "::error::DefectDojo rejected $1 with HTTP $code: $(head -c 300 /tmp/dd-resp.json)"; failed=1
+            fi
+          }
+          upload gitleaks.json     "Gitleaks Scan"       "gitleaks"
+          upload trufflehog.json   "Trufflehog Scan"     "trufflehog"
+          upload osv.json          "OSV Scan"            "osv-scanner"
+          upload trivy-config.json "Trivy Scan"          "trivy config"
+          upload semgrep.json      "Semgrep JSON Report" "semgrep"
+          upload zizmor.sarif      "SARIF"               "zizmor"
+          rm -f /tmp/dd-resp.json
+          exit "$failed"
+
+  gate:
+    name: gate
+    if: ${{ always() }}
+    needs: [secrets, dependencies, iac, sast, workflows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Decide
+        env:
+          EVENT: ${{ github.event_name }}
+          ENFORCE: ${{ inputs.enforce }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          # A scanner that did not finish is unknown, and unknown never passes.
+          crashed=$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<<"$RESULTS")
+          if [ -n "$crashed" ]; then echo "::error::scanner job(s) did not succeed: $crashed"; exit 1; fi
+          get() { jq -r --arg k "$1" '.[$k].outputs.blocking // "0"' <<<"$RESULTS"; }
+          fail=0
+          s=$(get secrets)
+          if [ "$s" != 0 ]; then
+            if [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; then
+              echo "::error::$s secret finding(s) in the new commits. Rotate the secret first, then remove it (docs/PLAN.md §8)."; fail=1
+            else
+              echo "::warning::$s secret finding(s) in the full history (reported, not blocking on $EVENT)."
+            fi
+          fi
+          for k in dependencies iac sast workflows; do
+            n=$(get "$k")
+            [ "$n" = 0 ] && continue
+            if [ "$ENFORCE" = true ]; then echo "::error::$k: $n blocking finding(s)"; fail=1
+            else echo "::warning::$k: $n finding(s) at or above the threshold (report mode, enforce: false)"
+            fi
+          done
+          exit "$fail"
