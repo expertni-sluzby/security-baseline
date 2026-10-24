@@ -53,7 +53,15 @@ Make the `baseline / gate` check required with a branch ruleset.
 | gate | — | — | the one check to require; a scanner job that did not finish fails it |
 
 Each push / scheduled run updates one DefectDojo engagement per branch (`ci/<branch>`), one
-test per tool; findings missing from a later run are closed.
+test per tool; findings missing from a later run are closed. Secret findings are the exception:
+a push scans only the pushed commits, so its upload adds and reopens secret findings but never
+closes one; only a full-history scan (schedule, dispatch, a push without a usable base) closes
+them.
+
+A leaked secret that has been rotated stays in the git history and keeps being reported. Once it
+is rotated (and only then), add its gitleaks fingerprint (`commit:file:rule:line`, in the run's
+`baseline-secrets` artifact) to `.gitleaksignore` in the consumer repo; the next full-history
+scan closes the finding.
 
 ## Supply chain
 
