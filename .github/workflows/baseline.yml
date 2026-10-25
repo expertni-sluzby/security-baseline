@@ -183,8 +183,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p reports
+          # osv-scanner reads an osv-scanner.toml only next to each lockfile; the repository's root one (its list
+          # of ignored advisories) is passed explicitly, so that it covers the lockfiles in subdirectories too.
+          config=()
+          [ -f osv-scanner.toml ] && config=(--config osv-scanner.toml)
           set +e
-          osv-scanner scan source --recursive --format json --output-file reports/osv.json .
+          osv-scanner scan source --recursive "${config[@]}" --format json --output-file reports/osv.json .
           rc=$?
           set -e
           # 0 = clean, 1 = vulnerabilities found, 128 = no lockfiles; anything else is a crash.

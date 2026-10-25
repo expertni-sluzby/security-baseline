@@ -45,7 +45,7 @@ Make the `baseline / gate` check required with a branch ruleset.
 | Job | Tool | Scope | Blocks |
 |---|---|---|---|
 | secrets | gitleaks, TruffleHog `--only-verified` | PR: the PR's commits · push: the pushed commits · schedule/dispatch: full history | **always** on PR/push; full-history hits are warnings |
-| dependencies | osv-scanner | all lockfiles, recursive | with `enforce`: CVSS ≥ 7 (≥ 9 for `critical`) |
+| dependencies | osv-scanner | all lockfiles, recursive; a root `osv-scanner.toml` applies to all of them | with `enforce`: CVSS ≥ 7 (≥ 9 for `critical`) |
 | iac | Trivy `config` | Dockerfile, Helm, Kubernetes, Terraform | with `enforce`: HIGH/CRITICAL |
 | sast | Semgrep `p/default` | whole repo, `.semgrepignore` respected | with `enforce`: ERROR/HIGH/CRITICAL |
 | workflows | zizmor | `.github/workflows/**` | with `enforce`: high |
@@ -62,6 +62,13 @@ A leaked secret that has been rotated stays in the git history and keeps being r
 is rotated (and only then), add its gitleaks fingerprint (`commit:file:rule:line`, in the run's
 `baseline-secrets` artifact) to `.gitleaksignore` in the consumer repo; the next full-history
 scan closes the finding.
+
+A dependency advisory whose vulnerable code the consumer cannot reach is ignored in
+`osv-scanner.toml` at the repository root (`[[IgnoredVulns]]` with `id`, `reason` and an
+`ignoreUntil` date, after which it is reported again). osv-scanner itself reads such a file only
+next to each lockfile, so the workflow passes the root one with `--config`, covering every
+lockfile. An advisory that is merely inconvenient is not ignored: it is fixed, or accepted in
+DefectDojo.
 
 ## Supply chain
 
