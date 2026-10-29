@@ -61,6 +61,21 @@ env:
   SEMGREP_IMAGE: semgrep/semgrep:1.179.0@sha256:93963d9295a366f59e4850127b1550400ee7b388f04fe144e4a1f6325d96e01b
   ZIZMOR_VERSION: 1.30.1
   ZIZMOR_SHA256: eee12266b793cb87ad4a7e3af2e72404f8a63e3de5eb099b80bf7b1cfd232a8e
+  # jq helpers shared by the Verdict steps. A workflow command (`::error file=..,line=..,title=..::msg`)
+  # needs `%` and newlines percent-encoded, and `:` and `,` as well inside property values; `cell`
+  # makes a value safe inside a markdown table. annotation(level) takes {file, line, end, title, msg};
+  # file may be empty (no location), line may be 0 (file only).
+  JQ_GH: |-
+    def esc: tostring | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A");
+    def prop: esc | gsub(":"; "%3A") | gsub(","; "%2C");
+    def cell: tostring | gsub("\\|"; "\\|") | gsub("\r?\n"; " ");
+    def annotation(level):
+      "::\(level) " + ([
+        (if (.file // "") != "" then "file=\(.file | prop)" else empty end),
+        (if (.file // "") != "" and (.line // 0) > 0 then "line=\(.line)" else empty end),
+        (if (.file // "") != "" and (.line // 0) > 0 and (.end // 0) >= .line then "endLine=\(.end)" else empty end),
+        "title=\(.title | prop)"
+      ] | join(",")) + "::" + (.msg | esc);
 
 jobs:
   secrets:
@@ -71,6 +86,7 @@ jobs:
       contents: read
     outputs:
       blocking: ${{ steps.verdict.outputs.blocking }}
+      detail: ${{ steps.verdict.outputs.detail }}
       scope: ${{ steps.range.outputs.scope }}
     steps:
       - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
@@ -137,18 +153,44 @@ jobs:
           rm reports/trufflehog.raw.json
       - id: verdict
         name: Verdict
+        env:
+          EVENT: ${{ github.event_name }}
+          SCOPE: ${{ steps.range.outputs.scope }}
         run: |
           set -euo pipefail
+          # Locations and rule names only, never a value: gitleaks ran with --redact and
+          # trufflehog's Raw/RawV2 were replaced above.
+          jq -c '.[] | {tool: "gitleaks", rule: .RuleID, file: .File, line: .StartLine, end: 0,
+                        commit: .Commit[0:8], fingerprint: .Fingerprint}' reports/gitleaks.json > findings.jsonl
+          jq -c '{tool: "trufflehog", rule: .DetectorName, file: (.SourceMetadata.Data.Git.file // ""),
+                  line: (.SourceMetadata.Data.Git.line // 0), end: 0,
+                  commit: ((.SourceMetadata.Data.Git.commit // "")[0:8]), fingerprint: ""}' reports/trufflehog.json >> findings.jsonl
+          jq -s '.' findings.jsonl > findings.json
           gl=$(jq 'length' reports/gitleaks.json)
-          th=$(grep -c . reports/trufflehog.json || true)
-          echo "blocking=$((gl + th))" >> "$GITHUB_OUTPUT"
+          n=$(jq 'length' findings.json)
+          th=$((n - gl))
+          scanned="the new commits"; [ "$SCOPE" = full ] && scanned="the full history"
+          # A new leak blocks a pull request or push; full-history hits are reported (see the gate).
+          level=warning; { [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; } && level=error
+          detail=$(jq -r '.[:3] | map("\(.tool) \(.rule) in \(.file):\(.line) (commit \(.commit))") | join("; ")' findings.json | tr -d '\n\r')
+          [ "$n" -gt 3 ] && detail="$detail; +$((n - 3)) more"
+          echo "blocking=$n" >> "$GITHUB_OUTPUT"
+          echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          jq -r --arg level "$level" "$JQ_GH"'.[:10][]
+            | .title = "secret: \(.tool) \(.rule)"
+            | .msg = "Commit \(.commit): \(.tool) rule \(.rule) matched in \(.file):\(.line). Rotate the secret first, then remove it from the code (docs/PLAN.md §8). A rotated secret that stays in the history is ignored by its fingerprint in .gitleaksignore (docs/baseline.md)."
+            | annotation($level)' findings.json
           {
             echo "### Secrets"
-            echo "| scanner | findings |"
-            echo "|---|---|"
-            echo "| gitleaks | $gl |"
-            echo "| trufflehog (verified) | $th |"
-            jq -r '.[] | "- gitleaks `\(.RuleID)` in `\(.File):\(.StartLine)` (commit \(.Commit[0:8]))"' reports/gitleaks.json | head -50
+            echo "$n finding(s) in $scanned: gitleaks $gl, trufflehog (verified) $th."
+            if [ "$n" != 0 ]; then
+              echo
+              echo "| tool | rule | location | commit | gitleaks fingerprint (for .gitleaksignore, once rotated) |"
+              echo "|---|---|---|---|---|"
+              jq -r "$JQ_GH"'.[:50][] | "| \(.tool) | `\(.rule | cell)` | `\(.file | cell):\(.line)` | \(.commit) | \(if .fingerprint != "" then "`\(.fingerprint | cell)`" else "" end) |"' findings.json
+              echo
+              echo "Rotate the secret first, then remove it from the code (docs/PLAN.md §8). No report contains the value itself."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -164,6 +206,8 @@ jobs:
       contents: read
     outputs:
       blocking: ${{ steps.verdict.outputs.blocking }}
+      lockfiles: ${{ steps.verdict.outputs.lockfiles }}
+      detail: ${{ steps.verdict.outputs.detail }}
     steps:
       - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
         with:
@@ -201,15 +245,61 @@ jobs:
         name: Verdict
         env:
           FAIL_ON: ${{ inputs.fail-on }}
+          ENFORCE: ${{ inputs.enforce }}
         run: |
           set -euo pipefail
           min=7.0; [ "$FAIL_ON" = critical ] && min=9.0
-          n=$(jq --argjson min "$min" '[.results[]?.packages[]?.groups[]?.max_severity | tonumber? | select(. >= $min)] | length' reports/osv.json)
-          total=$(jq '[.results[]?.packages[]?.groups[]?] | length' reports/osv.json)
+          level=warning; [ "$ENFORCE" = true ] && level=error
+          # One row per advisory and package version. osv-scanner reports a group per lockfile, so one
+          # advisory in the four lockfiles of one module used to read as "4 findings".
+          jq --argjson min "$min" --arg ws "$GITHUB_WORKSPACE/" '
+            [ .results[]? as $r | $r.packages[]? as $p | $p.groups[]? as $g
+              | ($g.max_severity | tonumber? // 0) as $sev
+              | [ $p.vulnerabilities[]? | select(.id as $id | $g.ids | index($id)) ] as $vulns
+              | { pkg: $p.package.name, version: $p.package.version, ids: $g.ids, sev: $sev, blocking: ($sev >= $min),
+                  lockfile: ($r.source.path | ltrimstr($ws)),
+                  summary: ([ $vulns[].summary // empty ] | first // ""),
+                  fixed: ([ $vulns[].affected[]? | select(.package.name == $p.package.name) | .ranges[]?.events[]?.fixed // empty ] | unique) } ]
+            | group_by([.pkg, .version, .ids]) | map(.[0] + { lockfiles: (map(.lockfile) | unique) } | del(.lockfile))
+            | sort_by(-.sev, .pkg)' reports/osv.json > advisories.json
+          n=$(jq '[.[] | select(.blocking)] | length' advisories.json)
+          total=$(jq 'length' advisories.json)
+          lockfiles=$(jq '[.[] | select(.blocking) | .lockfiles[]] | unique | length' advisories.json)
+          detail=$(jq -r '[.[] | select(.blocking)][:3]
+            | map("\(.pkg)@\(.version) \(.ids | join("/")) (CVSS \(.sev)\(if (.fixed | length) > 0 then ", fixed in \(.fixed | join(", "))" else ", no fixed version yet" end))")
+            | join("; ")' advisories.json | tr -d '\n\r')
+          [ "$n" -gt 3 ] && detail="$detail; +$((n - 3)) more"
           echo "blocking=$n" >> "$GITHUB_OUTPUT"
+          echo "lockfiles=$lockfiles" >> "$GITHUB_OUTPUT"
+          echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          jq -r --arg level "$level" "$JQ_GH"'[.[] | select(.blocking)][:10][]
+            | .file = .lockfiles[0] | .line = 0 | .end = 0
+            | .title = "dependency: \(.pkg)@\(.version) \(.ids | join("/"))"
+            | .msg = "CVSS \(.sev): \(.summary | rtrimstr(".")). \(if (.fixed | length) > 0 then "Fixed in \(.fixed | join(", "))." else "No fixed version yet." end) In \(.lockfiles | length) lockfile(s): \(.lockfiles[:5] | join(", "))\(if (.lockfiles | length) > 5 then ", ..." else "" end). https://osv.dev/vulnerability/\(.ids[0])"
+            | annotation($level)' advisories.json
           {
             echo "### Dependencies"
-            echo "$total vulnerability groups, $n at or above CVSS $min."
+            echo "$total advisories in total, $n at or above CVSS $min (in $lockfiles lockfile(s))."
+            if [ "$n" != 0 ]; then
+              echo
+              echo "| CVSS | package | advisory | fixed in | lockfiles |"
+              echo "|---|---|---|---|---|"
+              jq -r "$JQ_GH"'.[] | select(.blocking)
+                | "| \(.sev) | `\(.pkg | cell)@\(.version | cell)` | [\(.ids | join(", "))](https://osv.dev/vulnerability/\(.ids[0])) \(.summary | cell) | \(if (.fixed | length) > 0 then (.fixed | join(", ")) else "none yet" end) | \(.lockfiles | map("`\(cell)`") | join("<br>")) |"' advisories.json
+              echo
+              echo "Fix: upgrade to a fixed version. An advisory whose vulnerable code this repository cannot reach is ignored in \`osv-scanner.toml\` at the repository root (\`[[IgnoredVulns]]\` with \`id\`, \`reason\` and \`ignoreUntil\`); one that is merely inconvenient is fixed, or accepted in DefectDojo (docs/baseline.md)."
+            fi
+            if [ "$total" -gt "$n" ]; then
+              echo
+              echo "<details><summary>$((total - n)) below the threshold (reported, not blocking)</summary>"
+              echo
+              echo "| CVSS | package | advisory | fixed in |"
+              echo "|---|---|---|---|"
+              jq -r "$JQ_GH"'[.[] | select(.blocking | not)][:30][]
+                | "| \(.sev) | `\(.pkg | cell)@\(.version | cell)` | [\(.ids | join(", "))](https://osv.dev/vulnerability/\(.ids[0])) \(.summary | cell) | \(if (.fixed | length) > 0 then (.fixed | join(", ")) else "none yet" end) |"' advisories.json
+              echo
+              echo "</details>"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -225,6 +315,7 @@ jobs:
       contents: read
     outputs:
       blocking: ${{ steps.verdict.outputs.blocking }}
+      detail: ${{ steps.verdict.outputs.detail }}
     steps:
       - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
         with:
@@ -250,15 +341,37 @@ jobs:
         name: Verdict
         env:
           FAIL_ON: ${{ inputs.fail-on }}
+          ENFORCE: ${{ inputs.enforce }}
         run: |
           set -euo pipefail
-          sev='["HIGH","CRITICAL"]'; [ "$FAIL_ON" = critical ] && sev='["CRITICAL"]'
-          n=$(jq --argjson sev "$sev" '[.Results[]?.Misconfigurations[]? | select(.Status != "PASS") | select(.Severity as $s | $sev | index($s))] | length' reports/trivy-config.json)
-          total=$(jq '[.Results[]?.Misconfigurations[]? | select(.Status != "PASS")] | length' reports/trivy-config.json)
+          sev='["HIGH","CRITICAL"]'; threshold=HIGH; [ "$FAIL_ON" = critical ] && { sev='["CRITICAL"]'; threshold=CRITICAL; }
+          level=warning; [ "$ENFORCE" = true ] && level=error
+          jq --argjson sev "$sev" '
+            [ .Results[]? as $r | ($r.Misconfigurations // [])[] | select(.Status != "PASS")
+              | { id: (.AVDID // .ID), sev: .Severity, blocking: ((.Severity as $s | $sev | index($s)) != null),
+                  name: .Title, file: $r.Target, line: (.CauseMetadata.StartLine // 0), end: (.CauseMetadata.EndLine // 0),
+                  resolution: (.Resolution // ""), url: (.PrimaryURL // "") } ]
+            | sort_by((.sev as $s | ["CRITICAL", "HIGH", "MEDIUM", "LOW"] | index($s)) // 9, .file, .line)' reports/trivy-config.json > misconfigurations.json
+          n=$(jq '[.[] | select(.blocking)] | length' misconfigurations.json)
+          total=$(jq 'length' misconfigurations.json)
+          detail=$(jq -r '[.[] | select(.blocking)][:3] | map("\(.id) \(.sev) in \(.file):\(.line) (\(.name))") | join("; ")' misconfigurations.json | tr -d '\n\r')
+          [ "$n" -gt 3 ] && detail="$detail; +$((n - 3)) more"
           echo "blocking=$n" >> "$GITHUB_OUTPUT"
+          echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          jq -r --arg level "$level" "$JQ_GH"'[.[] | select(.blocking)][:10][]
+            | .title = "iac: \(.id) \(.sev)" | .msg = "\(.name). \(.resolution) \(.url)" | annotation($level)' misconfigurations.json
           {
             echo "### IaC"
-            echo "$total misconfigurations, $n at or above $FAIL_ON."
+            echo "$total misconfigurations in total, $n at or above $threshold."
+            if [ "$n" != 0 ]; then
+              echo
+              echo "| severity | check | location | finding | resolution |"
+              echo "|---|---|---|---|---|"
+              jq -r "$JQ_GH"'.[] | select(.blocking)
+                | "| \(.sev) | \(if .url != "" then "[\(.id)](\(.url))" else .id end) | `\(.file | cell):\(.line)` | \(.name | cell) | \(.resolution | cell) |"' misconfigurations.json
+              echo
+              echo "Fix: change the configuration as the resolution says. A confirmed false positive is listed by its check ID in \`.trivyignore\` at the repository root, with a comment saying why."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -274,6 +387,7 @@ jobs:
       contents: read
     outputs:
       blocking: ${{ steps.verdict.outputs.blocking }}
+      detail: ${{ steps.verdict.outputs.detail }}
     steps:
       - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
         with:
@@ -292,17 +406,38 @@ jobs:
         name: Verdict
         env:
           FAIL_ON: ${{ inputs.fail-on }}
+          ENFORCE: ${{ inputs.enforce }}
         run: |
           set -euo pipefail
           # Rules use either ERROR/WARNING/INFO or LOW..CRITICAL; ERROR counts as high.
-          sev='["ERROR","HIGH","CRITICAL"]'; [ "$FAIL_ON" = critical ] && sev='["CRITICAL"]'
-          n=$(jq --argjson sev "$sev" '[.results[] | select(.extra.severity as $s | $sev | index($s))] | length' reports/semgrep.json)
-          total=$(jq '.results | length' reports/semgrep.json)
+          sev='["ERROR","HIGH","CRITICAL"]'; threshold=ERROR/HIGH; [ "$FAIL_ON" = critical ] && { sev='["CRITICAL"]'; threshold=CRITICAL; }
+          level=warning; [ "$ENFORCE" = true ] && level=error
+          jq --argjson sev "$sev" '
+            [ .results[] | { id: .check_id, sev: .extra.severity, blocking: ((.extra.severity as $s | $sev | index($s)) != null),
+                file: .path, line: .start.line, end: .end.line, msg: ((.extra.message // "") | split("\n")[0]),
+                url: (.extra.metadata.shortlink // "") } ]
+            | sort_by((.sev as $s | ["CRITICAL", "ERROR", "HIGH", "MEDIUM", "WARNING", "LOW", "INFO"] | index($s)) // 9, .file, .line)' reports/semgrep.json > findings.json
+          n=$(jq '[.[] | select(.blocking)] | length' findings.json)
+          total=$(jq 'length' findings.json)
           errors=$(jq '.errors | length' reports/semgrep.json)
+          detail=$(jq -r '[.[] | select(.blocking)][:3] | map("\(.id) \(.sev) in \(.file):\(.line)") | join("; ")' findings.json | tr -d '\n\r')
+          [ "$n" -gt 3 ] && detail="$detail; +$((n - 3)) more"
           echo "blocking=$n" >> "$GITHUB_OUTPUT"
+          echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          jq -r --arg level "$level" "$JQ_GH"'[.[] | select(.blocking)][:10][]
+            | .title = "sast: \(.id) \(.sev)" | .msg = "\(.msg[:300]) \(.url)" | annotation($level)' findings.json
           {
             echo "### SAST"
-            echo "$total results, $n at or above $FAIL_ON ($errors scan errors)."
+            echo "$total results in total, $n at or above $threshold ($errors scan errors)."
+            if [ "$n" != 0 ]; then
+              echo
+              echo "| severity | rule | location | message |"
+              echo "|---|---|---|---|"
+              jq -r "$JQ_GH"'.[] | select(.blocking)
+                | "| \(.sev) | \(if .url != "" then "[\(.id | cell)](\(.url))" else (.id | cell) end) | `\(.file | cell):\(.line)` | \(.msg[:200] | cell) |"' findings.json
+              echo
+              echo "Fix: change the code as the rule says. A confirmed false positive gets a \`nosemgrep: <rule-id>\` comment on its line; a path that should not be scanned (generated or vendored code) goes to \`.semgrepignore\`."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -318,6 +453,7 @@ jobs:
       contents: read
     outputs:
       blocking: ${{ steps.verdict.outputs.blocking }}
+      detail: ${{ steps.verdict.outputs.detail }}
     steps:
       - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
         with:
@@ -350,14 +486,38 @@ jobs:
           case "$rc" in 0|1[0-4]) ;; *) echo "zizmor failed with exit code $rc"; exit "$rc" ;; esac
       - id: verdict
         name: Verdict
+        env:
+          ENFORCE: ${{ inputs.enforce }}
         run: |
           set -euo pipefail
-          n=$(jq '[.runs[].results[] | select(.level == "error")] | length' reports/zizmor.sarif)
-          total=$(jq '[.runs[].results[]] | length' reports/zizmor.sarif)
+          level=warning; [ "$ENFORCE" = true ] && level=error
+          # SARIF level error = zizmor high. Rule IDs are "zizmor/<audit>", documented at docs.zizmor.sh/audits/#<audit>.
+          jq '
+            [ .runs[].results[] | { id: (.ruleId | ltrimstr("zizmor/")), level: (.level // "note"), blocking: (.level == "error"),
+                file: (.locations[0].physicalLocation.artifactLocation.uri // ""),
+                line: (.locations[0].physicalLocation.region.startLine // 0), end: (.locations[0].physicalLocation.region.endLine // 0),
+                msg: ((.message.text // "") | split("\n")[0]) } ]
+            | sort_by((.level as $l | ["error", "warning", "note"] | index($l)) // 9, .file, .line)' reports/zizmor.sarif > findings.json
+          n=$(jq '[.[] | select(.blocking)] | length' findings.json)
+          total=$(jq 'length' findings.json)
+          detail=$(jq -r '[.[] | select(.blocking)][:3] | map("\(.id) in \(.file):\(.line)") | join("; ")' findings.json | tr -d '\n\r')
+          [ "$n" -gt 3 ] && detail="$detail; +$((n - 3)) more"
           echo "blocking=$n" >> "$GITHUB_OUTPUT"
+          echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          jq -r --arg level "$level" "$JQ_GH"'[.[] | select(.blocking)][:10][]
+            | .title = "workflow: \(.id) high" | .msg = "\(.msg) https://docs.zizmor.sh/audits/#\(.id)" | annotation($level)' findings.json
           {
             echo "### CI workflows"
-            echo "$total findings, $n high."
+            echo "$total findings in total, $n high."
+            if [ "$n" != 0 ]; then
+              echo
+              echo "| severity | audit | location | finding |"
+              echo "|---|---|---|---|"
+              jq -r "$JQ_GH"'.[] | select(.blocking)
+                | "| high | [\(.id | cell)](https://docs.zizmor.sh/audits/#\(.id)) | `\(.file | cell):\(.line)` | \(.msg | cell) |"' findings.json
+              echo
+              echo "Fix: change the workflow as the audit says. A confirmed false positive gets a \`# zizmor: ignore[<audit>]\` comment on its line."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -444,30 +604,79 @@ jobs:
     permissions: {}
     steps:
       - name: Decide
+        # The gate is the one red job a user sees, so its annotations say what blocked (the first
+        # findings by name), where the full list is (the run's Summary page) and what to do about it.
+        # The scanner jobs annotate the findings on file and line and write the tables.
         env:
           EVENT: ${{ github.event_name }}
           ENFORCE: ${{ inputs.enforce }}
+          FAIL_ON: ${{ inputs.fail-on }}
           RESULTS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
+          summary() { printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; }
           # A scanner that did not finish is unknown, and unknown never passes.
-          crashed=$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<<"$RESULTS")
-          if [ -n "$crashed" ]; then echo "::error::scanner job(s) did not succeed: $crashed"; exit 1; fi
-          get() { jq -r --arg k "$1" '.[$k].outputs.blocking // "0"' <<<"$RESULTS"; }
+          crashed=$(jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")' <<<"$RESULTS")
+          if [ -n "$crashed" ]; then
+            echo "::error title=gate blocked (a scanner did not finish)::The job(s) $crashed did not succeed, so nothing is known about what they scan and the gate fails. Open the job for its log; if the cause was transient (a download, the network), re-run the failed jobs."
+            summary "### Gate: failed" "" "Scanner job(s) did not finish: $crashed. Open the job for its log; re-run the failed jobs if the cause was transient."
+            exit 1
+          fi
+          get() { jq -r --arg k "$1" --arg f "$2" '.[$k].outputs[$f] // ""' <<<"$RESULTS"; }
+          plural() { if [ "$1" = 1 ]; then echo "${2%%|*}"; else echo "${2##*|}"; fi; }
+          where="the Summary page of this run"
+          declare -A section=([dependencies]=Dependencies [iac]=IaC [sast]=SAST [workflows]="CI workflows")
+          declare -A noun=([dependencies]="advisory|advisories" [iac]="misconfiguration|misconfigurations" [sast]="SAST finding|SAST findings" [workflows]="workflow finding|workflow findings")
+          declare -A threshold=([dependencies]="CVSS 7.0" [iac]="HIGH" [sast]="ERROR/HIGH" [workflows]="high")
+          [ "$FAIL_ON" = critical ] && threshold=([dependencies]="CVSS 9.0" [iac]="CRITICAL" [sast]="CRITICAL" [workflows]="high")
+          declare -A fix=(
+            [dependencies]="upgrade to a fixed version; an advisory whose vulnerable code the repository cannot reach is ignored in osv-scanner.toml with a reason and an ignoreUntil"
+            [iac]="change the configuration as the resolution says; a confirmed false positive is listed in .trivyignore"
+            [sast]="change the code as the rule says; a confirmed false positive gets a nosemgrep comment on its line, a path that should not be scanned goes to .semgrepignore"
+            [workflows]="change the workflow as the audit says (docs.zizmor.sh/audits); a confirmed false positive gets a zizmor: ignore comment on its line"
+          )
           fail=0
-          s=$(get secrets)
-          if [ "$s" != 0 ]; then
-            if [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; then
-              echo "::error::$s secret finding(s) in the new commits. Rotate the secret first, then remove it (docs/PLAN.md §8)."; fail=1
-            else
-              echo "::warning::$s secret finding(s) in the full history (reported, not blocking on $EVENT)."
-            fi
+          rows=""
+          blocked=""
+          s=$(get secrets blocking); s=${s:-0}
+          if [ "$s" = 0 ]; then
+            rows+="| secrets | 0 | ok |"$'\n'
+          elif [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; then
+            scanned="the new commits"; [ "$(get secrets scope)" = full ] && scanned="the history (this $EVENT had no usable base commit, so the whole history was scanned)"
+            echo "::error title=gate blocked by secrets::$s secret $(plural "$s" "finding|findings") in $scanned: $(get secrets detail). Rotate the secret first, then remove it from the code (docs/PLAN.md §8). Locations: the annotations of the job \"secrets (gitleaks + trufflehog)\" and $where, section Secrets."
+            rows+="| secrets | $s in $scanned | **blocks** |"$'\n'
+            blocked+="- **secrets**: $(get secrets detail). Rotate the secret first, then remove it from the code (docs/PLAN.md §8)."$'\n'
+            fail=1
+          else
+            echo "::warning title=gate report (secrets in the history)::$s secret $(plural "$s" "finding|findings") in the full history: $(get secrets detail). Reported, not blocking on $EVENT. A rotated secret that stays in the history is ignored by its fingerprint in .gitleaksignore (docs/baseline.md)."
+            rows+="| secrets | $s in the full history | reported |"$'\n'
           fi
           for k in dependencies iac sast workflows; do
-            n=$(get "$k")
-            [ "$n" = 0 ] && continue
-            if [ "$ENFORCE" = true ]; then echo "::error::$k: $n blocking finding(s)"; fail=1
-            else echo "::warning::$k: $n finding(s) at or above the threshold (report mode, enforce: false)"
+            n=$(get "$k" blocking); n=${n:-0}
+            if [ "$n" = 0 ]; then rows+="| $k | 0 | ok |"$'\n'; continue; fi
+            what="$n $(plural "$n" "${noun[$k]}") at or above ${threshold[$k]}"
+            if [ "$k" = dependencies ]; then l=$(get dependencies lockfiles); what="$what in $l $(plural "$l" "lockfile|lockfiles")"; fi
+            d=$(get "$k" detail)
+            if [ "$ENFORCE" = true ]; then
+              echo "::error title=gate blocked by $k::$what: $d. Full list: $where, section ${section[$k]}. Fix: ${fix[$k]} (docs/baseline.md)."
+              rows+="| $k | $what | **blocks** |"$'\n'
+              blocked+="- **$k**: $d. Fix: ${fix[$k]} (docs/baseline.md)."$'\n'
+              fail=1
+            else
+              echo "::warning title=gate report ($k, enforce is false)::$what: $d. Not blocking: enforce is false. Full list: $where, section ${section[$k]}."
+              rows+="| $k | $what | reported (enforce: false) |"$'\n'
             fi
           done
+          verdict=passed; [ "$fail" = 1 ] && verdict=failed
+          summary "### Gate: $verdict" "" "| scanner | at or above the threshold | verdict |" "|---|---|---|"
+          printf '%s' "$rows" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$blocked" ]; then
+            summary "" "What blocks, and what to do:" ""
+            printf '%s' "$blocked" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$fail" = 1 ] && [ "$EVENT" = pull_request ]; then
+            note="The scanners look at the whole repository at this pull request's head, not only at its changes, so a blocking finding may predate the pull request (an advisory published yesterday blocks every branch today). Fix it here, or merge the fix to the base branch and update this branch."
+            echo "::notice title=gate scope::$note"
+            summary "" "$note"
+          fi
           exit "$fail"
