@@ -19,4 +19,3 @@ jobs:
       contents: read
     with:
       enforce: true
-      runs-on: '["self-hosted", "linux"]'
