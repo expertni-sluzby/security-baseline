@@ -43,6 +43,13 @@ on:
         description: "Lowest severity that blocks when enforce is on: high or critical"
         type: string
         default: high
+      runs-on:
+        description: >-
+          Runner of every job as JSON: a label ("ubuntu-24.04", the default) or a list of labels
+          ('["self-hosted", "linux"]' for the organisation's ARC runners). Missing tools are installed on self-hosted
+          runners; Harden-Runner only audits on GitHub-hosted runners.
+        type: string
+        default: '"ubuntu-24.04"'
     secrets:
       DEFECTDOJO_TOKEN:
         required: false
@@ -80,7 +87,7 @@ env:
 jobs:
   secrets:
     name: secrets (gitleaks + trufflehog)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -200,7 +207,7 @@ jobs:
 
   dependencies:
     name: dependencies (osv-scanner)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -309,7 +316,7 @@ jobs:
 
   iac:
     name: iac (trivy config)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -381,7 +388,7 @@ jobs:
 
   sast:
     name: sast (semgrep)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -447,7 +454,7 @@ jobs:
 
   workflows:
     name: workflows (zizmor)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -461,6 +468,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Python venv on a self-hosted runner
+        if: runner.environment == 'self-hosted'
+        run: python3 -c "import ensurepip" 2>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends python3-venv)
       - name: Install zizmor (pinned wheel, hash-verified)
         run: |
           set -euo pipefail
@@ -531,7 +541,7 @@ jobs:
     # Pull requests are gated in CI but not recorded (fork PRs carry no secrets anyway).
     if: ${{ always() && github.event_name != 'pull_request' && inputs.defectdojo-url != '' }}
     needs: [secrets, dependencies, iac, sast, workflows]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -599,7 +609,7 @@ jobs:
     name: gate
     if: ${{ always() }}
     needs: [secrets, dependencies, iac, sast, workflows]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 5
     permissions: {}
     steps:
