@@ -39,6 +39,7 @@ Make the `baseline / gate` check required with a branch ruleset.
 | `defectdojo-url` | empty | empty = no upload |
 | `enforce` | `false` | block on dependency / IaC / SAST / workflow findings at or above `fail-on` |
 | `fail-on` | `high` | `high` or `critical` |
+| `runs-on` | `"ubuntu-24.04"` | runner of every job as JSON; `'["self-hosted", "linux"]'` runs on the organisation's ARC runners (Ubuntu 24.04, Docker in Docker) instead of paid GitHub-hosted minutes. Missing packages (python3-venv) are installed there; Harden-Runner audits only on GitHub-hosted runners. Only for private repositories: the organisation's runner group refuses public ones, which is right (a fork's pull request would run on our runner), and GitHub-hosted minutes are free for public repositories. |
 
 ## What runs
 
