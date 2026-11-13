@@ -65,7 +65,10 @@ env:
   OSV_SCANNER_SHA256: ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
   TRIVY_VERSION: 0.75.0
   TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
-  SEMGREP_IMAGE: semgrep/semgrep:1.179.0@sha256:93963d9295a366f59e4850127b1550400ee7b388f04fe144e4a1f6325d96e01b
+  # Semgrep 1.179.0 from Docker Hub through the company Harbor's public proxy cache (project `bitnami`, upstream Docker Hub): runners that share
+  # an egress address (the ARC scale sets) hit Docker Hub's anonymous pull limit and the sast job failed with exit 125. The digest is the same as
+  # on Docker Hub, so the pin holds; the proxy is public (anonymous pull), so GitHub-hosted runners reach it too.
+  SEMGREP_IMAGE: harbor-registry.webgame.cluster.expertni-sluzby.cz/bitnami/semgrep/semgrep:1.179.0@sha256:93963d9295a366f59e4850127b1550400ee7b388f04fe144e4a1f6325d96e01b
   ZIZMOR_VERSION: 1.30.1
   ZIZMOR_SHA256: eee12266b793cb87ad4a7e3af2e72404f8a63e3de5eb099b80bf7b1cfd232a8e
   # jq helpers shared by the Verdict steps. A workflow command (`::error file=..,line=..,title=..::msg`)
