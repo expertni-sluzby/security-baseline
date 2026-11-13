@@ -307,6 +307,8 @@ in this design and is treated as such.
 | 3 | L4 PR review + first scheduled full audit per product; L5 marketplace | first audit's confirmed findings in DefectDojo with owners |
 | 4 | All repos in all organizations; required check via rulesets; SAMM baseline per team | every active repo has a profile and a green required `baseline` |
 
+Who has adopted the baseline so far, and at which version: [consumers.md](consumers.md).
+
 The phase-1 detection test is the acceptance proof for the whole approach: a control that
 cannot catch the bugs we already had is not a control. The corpus itself is private to the
 pilot product.

@@ -30,6 +30,11 @@ jobs:
 `DEFECTDOJO_URL` (variable) and `DEFECTDOJO_TOKEN` (secret) are set once per organization.
 Make the `baseline / gate` check required with a branch ruleset.
 
+## Consumers
+
+The repositories that use this workflow and the version each one pins: [consumers.md](consumers.md). Adopting the
+baseline, moving a pin or dropping it means updating that list too.
+
 ## Inputs
 
 | Input | Default | Meaning |
