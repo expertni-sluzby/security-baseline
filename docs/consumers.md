@@ -8,6 +8,7 @@ Last checked: **2026-11-13** (code search, see below). Current release: **v1.1.1
 | Repository | Workflow | Pin | Runner (`runs-on`) | DefectDojo product |
 |---|---|---|---|---|
 | `expertni-sluzby/municipality-database` | `.github/workflows/security.yml` | v1.1.1 (`79ef441`) | ARC `["self-hosted", "linux"]` | repository name |
+| `expertni-sluzby/svethrist` | `.github/workflows/security.yml` | v1.1.1 (`79ef441`) | ARC `["self-hosted", "linux"]` | repository name |
 | `expertni-sluzby/svethrist-premium-profil-baseline` | `.github/workflows/security.yml` | v1.1.0 (`b1d1b92`) | ARC `["self-hosted", "linux"]` | `premium-profil` |
 | `expertni-sluzby/es-cluster-dashboard` | `.github/workflows/security.yml` | v1.1.0 (`b1d1b92`) | ARC `["self-hosted", "linux"]` | repository name |
 | `expertni-sluzby/svethrist-database-toolkit` | `.github/workflows/security.yml` | v1.1.0 (`b1d1b92`) | ARC `["self-hosted", "linux"]` | `svethrist-database-toolkit` |
@@ -15,7 +16,7 @@ Last checked: **2026-11-13** (code search, see below). Current release: **v1.1.1
 | `expertni-sluzby/orion-roadmap` | `.github/workflows/security.yml` | v1.0.3 (`b3ec832`) | GitHub-hosted (default) | repository name |
 | `letco-ai/letco-monorepo` | `.github/workflows/security-baseline.yml` | v1.1.0 (`b1d1b92`) | ARC `["self-hosted", "linux"]` | `letco-monorepo` (type `letco-ai`) |
 
-All seven are private repositories.
+All eight are private repositories.
 
 ## Checking the list
 
