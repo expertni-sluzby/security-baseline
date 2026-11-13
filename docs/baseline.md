@@ -99,7 +99,7 @@ branch today. Fix it in the PR, or merge the fix to the base branch and update t
 
 ## Supply chain
 
-Scanners are release binaries (Semgrep: an image) pinned by version and sha256 and at least
+Scanners are release binaries (Semgrep: an image, pulled through the company Harbor's public proxy of Docker Hub) pinned by version and sha256 and at least
 14 days old when pinned; actions are pinned by commit SHA; no third-party scanner actions;
 no `${{ }}` inside `run:`. Reports are artifacts (public on a public repo): gitleaks runs with
 `--redact`, TruffleHog values are replaced before upload.
