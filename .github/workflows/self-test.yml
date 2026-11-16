@@ -1,5 +1,6 @@
 # This repo is its own first consumer: every change to baseline.yml runs baseline.yml,
 # enforced, against this repo (zizmor audits the workflows that every consumer trusts).
+# It is held to its own rules too, and it runs their tests (rules/, tests/; docs/baseline.md).
 name: self-test
 
 on:
@@ -19,3 +20,4 @@ jobs:
       contents: read
     with:
       enforce: true
+      baseline-rules: enforce

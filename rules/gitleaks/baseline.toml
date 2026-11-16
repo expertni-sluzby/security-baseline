@@ -1,0 +1,32 @@
+# The baseline's own gitleaks rules (docs/baseline.md, "Baseline rules"). baseline.yml runs them as a second gitleaks
+# pass over the same commits, so the consumer's .gitleaks.toml (read by the first pass) stays as it is; .gitleaksignore
+# and `gitleaks:allow` apply to both passes. Findings carry the rule IDs below.
+#
+# The password is a public framework default: ABP Framework's (the admin password of IdentityDataSeedContributor and the
+# client secrets of its solution templates, in either case of the "e"). The regex and the keyword spell it so that they
+# never match this file. ASP.NET Boilerplate's default is left to the Semgrep rules: it is also a common password, and
+# password dictionaries (zxcvbn, in many web roots) list it.
+# Tests: tests/gitleaks/ (src/ is scanned, expected.txt lists the findings it must give).
+
+title = "security-baseline rules"
+
+[[rules]]
+id = "security-baseline-framework-default-password"
+description = "Known framework default password (ABP Framework): use a managed secret, keep a default only for Development"
+regex = '''(?i)(?:^|[^0-9a-z])(1q2w3e\*)(?:[^0-9a-z]|$)'''
+secretGroup = 1
+keywords = ["1q2w3e"]
+tags = ["default-credential", "security-baseline"]
+
+  # Test code and fixtures, the local configuration of the Development environment, and prose (a document that names
+  # the default is not a credential in use).
+  [[rules.allowlists]]
+  description = "tests, Development configuration, documentation"
+  paths = [
+    '''(?i)(^|/)(test|tests|testing|__tests__|spec|specs|fixtures|testdata)/''',
+    '''(^|/)[^/]+\.(Tests|Test|TestBase|IntegrationTests|UnitTests|E2ETests)/''',
+    '''(^|/)[^/]+Tests?\.cs$''',
+    '''\.(test|spec)\.[cm]?[jt]sx?$''',
+    '''(^|/)appsettings\.(Development|Local|Test)[^/]*\.json$''',
+    '''(?i)\.(md|mdx|markdown|rst|adoc|txt)$''',
+  ]
