@@ -16,6 +16,8 @@
 # Nothing from `${{ }}` is interpolated into a `run:` script; values travel through `env:`.
 # Reports are uploaded as artifacts, which are PUBLIC on public repos: secret scanners run
 # with redaction, and nothing writes a secret value into a report.
+# The baseline's own rules (rules/) are checked out from the commit of this workflow file (job.workflow_sha), the one
+# the caller pinned, so they are as pinned as the workflow itself.
 name: baseline
 
 on:
@@ -43,6 +45,14 @@ on:
         description: "Lowest severity that blocks when enforce is on: high or critical"
         type: string
         default: high
+      baseline-rules:
+        description: >-
+          How findings of the baseline's own rules (rules/: Semgrep next to p/default, a second gitleaks pass) count.
+          "report" (the default for now): annotated, on the Summary page and in DefectDojo, never blocking.
+          "enforce": they block like the other findings of their scanner (Semgrep with enforce at fail-on, gitleaks on
+          every pull request and push). See docs/baseline.md, "Baseline rules".
+        type: string
+        default: report
       runs-on:
         description: >-
           Runner of every job as JSON: a label ("ubuntu-24.04", the default) or a list of labels
@@ -97,6 +107,8 @@ jobs:
     outputs:
       blocking: ${{ steps.verdict.outputs.blocking }}
       detail: ${{ steps.verdict.outputs.detail }}
+      reported: ${{ steps.verdict.outputs.reported }}
+      reported-detail: ${{ steps.verdict.outputs.reported-detail }}
       scope: ${{ steps.range.outputs.scope }}
     steps:
       - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
@@ -106,6 +118,29 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # The same two steps in the sast job.
+      - name: Check out the baseline's rules (the commit of this workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .security-baseline
+          sparse-checkout: |
+            rules
+            tests
+          persist-credentials: false
+      - name: Move the rules out of the scanned tree
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # Without job.workflow_sha the checkout above falls back to this repository; unknown rules never pass.
+          head=$(git -C .security-baseline rev-parse HEAD)
+          if [ -z "$WORKFLOW_SHA" ] || [ "$head" != "$WORKFLOW_SHA" ] || [ ! -d .security-baseline/rules ]; then
+            echo "::error title=baseline rules not found::The baseline's rules could not be checked out at the commit of this workflow (job.workflow_sha '${WORKFLOW_SHA}', checked out '${head}'). Re-run the job; if it persists, report it in expertni-sluzby/security-baseline."
+            exit 1
+          fi
+          mv .security-baseline "$RUNNER_TEMP/security-baseline"
       - name: Install gitleaks and trufflehog (pinned, checksum-verified)
         run: |
           set -euo pipefail
@@ -146,8 +181,27 @@ jobs:
           mkdir -p reports
           opts="--no-merges"
           [ -n "$BASE" ] && opts="--no-merges $BASE..HEAD"
+          # The repository's .gitleaks.toml (or gitleaks' default rules), then the baseline's own rules over the same
+          # commits. One report: their rule IDs (security-baseline-*) tell them apart, DefectDojo gets one gitleaks test.
           gitleaks git --log-opts="$opts" --redact --no-banner --exit-code 0 \
-            --report-format json --report-path reports/gitleaks.json .
+            --report-format json --report-path reports/gitleaks-repo.json .
+          gitleaks git --config "$RUNNER_TEMP/security-baseline/rules/gitleaks/baseline.toml" --log-opts="$opts" \
+            --redact --no-banner --exit-code 0 --report-format json --report-path reports/gitleaks-baseline.json .
+          jq -s 'add' reports/gitleaks-repo.json reports/gitleaks-baseline.json > reports/gitleaks.json
+          rm reports/gitleaks-repo.json reports/gitleaks-baseline.json
+      - name: Test the baseline's gitleaks rules (only when the baseline tests itself)
+        if: github.repository == job.workflow_repository
+        run: |
+          set -euo pipefail
+          t="$RUNNER_TEMP/security-baseline/tests/gitleaks"
+          (cd "$t/src" && gitleaks dir --config "$RUNNER_TEMP/security-baseline/rules/gitleaks/baseline.toml" --redact \
+            --no-banner --exit-code 0 --report-format json --report-path "$RUNNER_TEMP/gitleaks-test.json" .)
+          jq -r '.[] | "\(.File):\(.StartLine)"' "$RUNNER_TEMP/gitleaks-test.json" | LC_ALL=C sort > "$RUNNER_TEMP/gitleaks-test.txt"
+          if ! LC_ALL=C sort "$t/expected.txt" | diff -u - "$RUNNER_TEMP/gitleaks-test.txt"; then
+            echo "::error title=baseline rules::The gitleaks rules find something else in tests/gitleaks/src than tests/gitleaks/expected.txt lists (the diff above: - expected, + found)."
+            exit 1
+          fi
+          echo "gitleaks rules: $(wc -l < "$RUNNER_TEMP/gitleaks-test.txt") expected findings, nothing else."
       - name: trufflehog (verified secrets only)
         env:
           BASE: ${{ steps.range.outputs.base }}
@@ -166,6 +220,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           SCOPE: ${{ steps.range.outputs.scope }}
+          BASELINE_RULES: ${{ inputs.baseline-rules }}
         run: |
           set -euo pipefail
           # Locations and rule names only, never a value: gitleaks ran with --redact and
@@ -175,31 +230,50 @@ jobs:
           jq -c '{tool: "trufflehog", rule: .DetectorName, file: (.SourceMetadata.Data.Git.file // ""),
                   line: (.SourceMetadata.Data.Git.line // 0), end: 0,
                   commit: ((.SourceMetadata.Data.Git.commit // "")[0:8]), fingerprint: ""}' reports/trufflehog.json >> findings.jsonl
-          jq -s '.' findings.jsonl > findings.json
+          # A finding of the baseline's own rules (security-baseline-*) blocks only with baseline-rules: enforce.
+          jq -s --arg mode "$BASELINE_RULES" 'map((.rule | startswith("security-baseline-")) as $own
+            | . + {own: $own, blocks: (($own | not) or $mode == "enforce")})' findings.jsonl > findings.json
+          all=$(jq 'length' findings.json)
           gl=$(jq 'length' reports/gitleaks.json)
-          n=$(jq 'length' findings.json)
-          th=$((n - gl))
+          own=$(jq '[.[] | select(.own)] | length' findings.json)
+          th=$((all - gl))
+          n=$(jq '[.[] | select(.blocks)] | length' findings.json)
+          reported=$((all - n))
           scanned="the new commits"; [ "$SCOPE" = full ] && scanned="the full history"
           # A new leak blocks a pull request or push; full-history hits are reported (see the gate).
           level=warning; { [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; } && level=error
-          detail=$(jq -r '.[:3] | map("\(.tool) \(.rule) in \(.file):\(.line) (commit \(.commit))") | join("; ")' findings.json | tr -d '\n\r')
+          detail=$(jq -r '[.[] | select(.blocks)][:3] | map("\(.tool) \(.rule) in \(.file):\(.line) (commit \(.commit))") | join("; ")' findings.json | tr -d '\n\r')
           [ "$n" -gt 3 ] && detail="$detail; +$((n - 3)) more"
+          rdetail=$(jq -r '[.[] | select(.blocks | not)][:3] | map("\(.rule) in \(.file):\(.line) (commit \(.commit))") | join("; ")' findings.json | tr -d '\n\r')
+          [ "$reported" -gt 3 ] && rdetail="$rdetail; +$((reported - 3)) more"
           echo "blocking=$n" >> "$GITHUB_OUTPUT"
           echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          echo "reported=$reported" >> "$GITHUB_OUTPUT"
+          echo "reported-detail=$rdetail" >> "$GITHUB_OUTPUT"
+          # A known default password is public, not leaked: there is nothing to rotate away from the history, only to
+          # stop using it. Hence its own message.
           jq -r --arg level "$level" "$JQ_GH"'.[:10][]
-            | .title = "secret: \(.tool) \(.rule)"
-            | .msg = "Commit \(.commit): \(.tool) rule \(.rule) matched in \(.file):\(.line). Rotate the secret first, then remove it from the code (docs/PLAN.md §8). A rotated secret that stays in the history is ignored by its fingerprint in .gitleaksignore (docs/baseline.md)."
-            | annotation($level)' findings.json
+            | (if .blocks then $level else "warning" end) as $l
+            | .title = "secret: \(.tool) \(.rule)\(if .blocks then "" else " (baseline-rules: report)" end)"
+            | .msg = (if .own
+                then "Commit \(.commit): a publicly known framework default password in \(.file):\(.line). Wherever it is in use, change the credential and take it from a managed secret (a sealed / Kubernetes Secret, a key vault); a default belongs only to the Development configuration or to tests. An accepted spot is ignored by its fingerprint in .gitleaksignore (docs/baseline.md, Baseline rules)."
+                else "Commit \(.commit): \(.tool) rule \(.rule) matched in \(.file):\(.line). Rotate the secret first, then remove it from the code (docs/PLAN.md §8). A rotated secret that stays in the history is ignored by its fingerprint in .gitleaksignore (docs/baseline.md)." end)
+            | annotation($l)' findings.json
           {
             echo "### Secrets"
-            echo "$n finding(s) in $scanned: gitleaks $gl, trufflehog (verified) $th."
-            if [ "$n" != 0 ]; then
+            echo "$all finding(s) in $scanned: gitleaks $gl (of them $own by the baseline's own rules), trufflehog (verified) $th."
+            if [ "$all" != 0 ]; then
               echo
               echo "| tool | rule | location | commit | gitleaks fingerprint (for .gitleaksignore, once rotated) |"
               echo "|---|---|---|---|---|"
-              jq -r "$JQ_GH"'.[:50][] | "| \(.tool) | `\(.rule | cell)` | `\(.file | cell):\(.line)` | \(.commit) | \(if .fingerprint != "" then "`\(.fingerprint | cell)`" else "" end) |"' findings.json
+              jq -r "$JQ_GH"'.[:50][] | "| \(.tool) | `\(.rule | cell)`\(if .blocks then "" else " (reported)" end) | `\(.file | cell):\(.line)` | \(.commit) | \(if .fingerprint != "" then "`\(.fingerprint | cell)`" else "" end) |"' findings.json
               echo
               echo "Rotate the secret first, then remove it from the code (docs/PLAN.md §8). No report contains the value itself."
+            fi
+            if [ "$own" != 0 ]; then
+              echo
+              echo "\`security-baseline-*\` rules find publicly known framework default passwords: not a leak to rotate away, a credential to stop using (docs/baseline.md, Baseline rules)."
+              if [ "$reported" != 0 ]; then echo "With \`baseline-rules: report\` they are reported, not blocking."; fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -398,6 +472,8 @@ jobs:
     outputs:
       blocking: ${{ steps.verdict.outputs.blocking }}
       detail: ${{ steps.verdict.outputs.detail }}
+      reported: ${{ steps.verdict.outputs.reported }}
+      reported-detail: ${{ steps.verdict.outputs.reported-detail }}
     steps:
       - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
         with:
@@ -405,37 +481,81 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The same two steps in the secrets job.
+      - name: Check out the baseline's rules (the commit of this workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .security-baseline
+          sparse-checkout: |
+            rules
+            tests
+          persist-credentials: false
+      - name: Move the rules out of the scanned tree
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # Without job.workflow_sha the checkout above falls back to this repository; unknown rules never pass.
+          head=$(git -C .security-baseline rev-parse HEAD)
+          if [ -z "$WORKFLOW_SHA" ] || [ "$head" != "$WORKFLOW_SHA" ] || [ ! -d .security-baseline/rules ]; then
+            echo "::error title=baseline rules not found::The baseline's rules could not be checked out at the commit of this workflow (job.workflow_sha '${WORKFLOW_SHA}', checked out '${head}'). Re-run the job; if it persists, report it in expertni-sluzby/security-baseline."
+            exit 1
+          fi
+          mv .security-baseline "$RUNNER_TEMP/security-baseline"
+      - name: Test the baseline's Semgrep rules (only when the baseline tests itself)
+        if: github.repository == job.workflow_repository
+        run: |
+          set -euo pipefail
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$RUNNER_TEMP/security-baseline:/baseline:ro" -w /baseline "$SEMGREP_IMAGE" \
+            semgrep scan --test --metrics off --disable-version-check --config rules/semgrep/ tests/semgrep/
       - name: semgrep (pinned image digest, metrics off)
         run: |
           set -euo pipefail
           mkdir -p reports
-          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
-            semgrep scan --config p/default --metrics off --disable-version-check \
+          # p/default and the baseline's own rules. Mounted at /security-baseline, their rule IDs read
+          # security-baseline.<rule> (in nosemgrep comments the <rule> alone is enough).
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" \
+            -v "$RUNNER_TEMP/security-baseline/rules/semgrep:/security-baseline:ro" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan --config p/default --config /security-baseline --metrics off --disable-version-check \
             --json --output reports/semgrep.json .
       - id: verdict
         name: Verdict
         env:
           FAIL_ON: ${{ inputs.fail-on }}
           ENFORCE: ${{ inputs.enforce }}
+          BASELINE_RULES: ${{ inputs.baseline-rules }}
         run: |
           set -euo pipefail
           # Rules use either ERROR/WARNING/INFO or LOW..CRITICAL; ERROR counts as high.
           sev='["ERROR","HIGH","CRITICAL"]'; threshold=ERROR/HIGH; [ "$FAIL_ON" = critical ] && { sev='["CRITICAL"]'; threshold=CRITICAL; }
           level=warning; [ "$ENFORCE" = true ] && level=error
-          jq --argjson sev "$sev" '
-            [ .results[] | { id: .check_id, sev: .extra.severity, blocking: ((.extra.severity as $s | $sev | index($s)) != null),
-                file: .path, line: .start.line, end: .end.line, msg: ((.extra.message // "") | split("\n")[0]),
-                url: (.extra.metadata.shortlink // "") } ]
+          # A finding of the baseline's own rules (security-baseline.*) counts only with baseline-rules: enforce;
+          # with report, every one of them is listed and annotated as a warning, whatever its severity.
+          jq --argjson sev "$sev" --arg mode "$BASELINE_RULES" '
+            [ .results[] | (.check_id | startswith("security-baseline.")) as $own
+              | { id: .check_id, sev: .extra.severity, own: $own, reported: ($own and $mode != "enforce"),
+                  blocking: (((.extra.severity as $s | $sev | index($s)) != null) and (($own | not) or $mode == "enforce")),
+                  file: .path, line: .start.line, end: .end.line, msg: ((.extra.message // "") | split("\n")[0]),
+                  url: (.extra.metadata.shortlink // (.extra.metadata.references // [])[0] // "") } ]
             | sort_by((.sev as $s | ["CRITICAL", "ERROR", "HIGH", "MEDIUM", "WARNING", "LOW", "INFO"] | index($s)) // 9, .file, .line)' reports/semgrep.json > findings.json
           n=$(jq '[.[] | select(.blocking)] | length' findings.json)
+          reported=$(jq '[.[] | select(.reported)] | length' findings.json)
           total=$(jq 'length' findings.json)
           errors=$(jq '.errors | length' reports/semgrep.json)
           detail=$(jq -r '[.[] | select(.blocking)][:3] | map("\(.id) \(.sev) in \(.file):\(.line)") | join("; ")' findings.json | tr -d '\n\r')
           [ "$n" -gt 3 ] && detail="$detail; +$((n - 3)) more"
+          rdetail=$(jq -r '[.[] | select(.reported)][:3] | map("\(.id) \(.sev) in \(.file):\(.line)") | join("; ")' findings.json | tr -d '\n\r')
+          [ "$reported" -gt 3 ] && rdetail="$rdetail; +$((reported - 3)) more"
           echo "blocking=$n" >> "$GITHUB_OUTPUT"
           echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          echo "reported=$reported" >> "$GITHUB_OUTPUT"
+          echo "reported-detail=$rdetail" >> "$GITHUB_OUTPUT"
           jq -r --arg level "$level" "$JQ_GH"'[.[] | select(.blocking)][:10][]
             | .title = "sast: \(.id) \(.sev)" | .msg = "\(.msg[:300]) \(.url)" | annotation($level)' findings.json
+          jq -r "$JQ_GH"'[.[] | select(.reported)][:10][]
+            | .title = "sast: \(.id) \(.sev) (baseline-rules: report)" | .msg = "\(.msg[:300]) \(.url)" | annotation("warning")' findings.json
           {
             echo "### SAST"
             echo "$total results in total, $n at or above $threshold ($errors scan errors)."
@@ -447,6 +567,18 @@ jobs:
                 | "| \(.sev) | \(if .url != "" then "[\(.id | cell)](\(.url))" else (.id | cell) end) | `\(.file | cell):\(.line)` | \(.msg[:200] | cell) |"' findings.json
               echo
               echo "Fix: change the code as the rule says. A confirmed false positive gets a \`nosemgrep: <rule-id>\` comment on its line; a path that should not be scanned (generated or vendored code) goes to \`.semgrepignore\`."
+            fi
+            if [ "$reported" != 0 ]; then
+              echo
+              echo "#### Baseline rules (reported, not blocking: \`baseline-rules: report\`)"
+              echo
+              echo "| severity | rule | location | message |"
+              echo "|---|---|---|---|"
+              jq -r "$JQ_GH"'[.[] | select(.reported)][:50][]
+                | "| \(.sev) | \(if .url != "" then "[\(.id | cell)](\(.url))" else (.id | cell) end) | `\(.file | cell):\(.line)` | \(.msg[:200] | cell) |"' findings.json
+              if [ "$reported" -gt 50 ]; then echo; echo "+$((reported - 50)) more in the \`baseline-sast\` artifact."; fi
+              echo
+              echo "They block once the caller sets \`baseline-rules: enforce\` (ERROR with \`enforce: true\`). Fix as the rule says; an accepted spot gets a \`nosemgrep: <rule>\` comment with the reason (docs/baseline.md, Baseline rules)."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -624,10 +756,18 @@ jobs:
           EVENT: ${{ github.event_name }}
           ENFORCE: ${{ inputs.enforce }}
           FAIL_ON: ${{ inputs.fail-on }}
+          BASELINE_RULES: ${{ inputs.baseline-rules }}
           RESULTS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
           summary() { printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; }
+          case "$BASELINE_RULES" in
+            report|enforce) ;;
+            *)
+              echo "::error title=gate blocked (invalid input)::baseline-rules is '$BASELINE_RULES'; it takes report or enforce (docs/baseline.md)."
+              summary "### Gate: failed" "" "The input baseline-rules is '$BASELINE_RULES'; it takes report or enforce."
+              exit 1 ;;
+          esac
           # A scanner that did not finish is unknown, and unknown never passes.
           crashed=$(jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")' <<<"$RESULTS")
           if [ -n "$crashed" ]; then
@@ -656,9 +796,9 @@ jobs:
             rows+="| secrets | 0 | ok |"$'\n'
           elif [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; then
             scanned="the new commits"; [ "$(get secrets scope)" = full ] && scanned="the history (this $EVENT had no usable base commit, so the whole history was scanned)"
-            echo "::error title=gate blocked by secrets::$s secret $(plural "$s" "finding|findings") in $scanned: $(get secrets detail). Rotate the secret first, then remove it from the code (docs/PLAN.md §8). Locations: the annotations of the job \"secrets (gitleaks + trufflehog)\" and $where, section Secrets."
+            echo "::error title=gate blocked by secrets::$s secret $(plural "$s" "finding|findings") in $scanned: $(get secrets detail). Rotate the secret first, then remove it from the code (docs/PLAN.md §8); a security-baseline-* finding is a publicly known default password, to stop using rather than rotate (docs/baseline.md, Baseline rules). Locations: the annotations of the job \"secrets (gitleaks + trufflehog)\" and $where, section Secrets."
             rows+="| secrets | $s in $scanned | **blocks** |"$'\n'
-            blocked+="- **secrets**: $(get secrets detail). Rotate the secret first, then remove it from the code (docs/PLAN.md §8)."$'\n'
+            blocked+="- **secrets**: $(get secrets detail). Rotate the secret first, then remove it from the code (docs/PLAN.md §8); a security-baseline-* finding is a publicly known default password, to stop using (docs/baseline.md, Baseline rules)."$'\n'
             fail=1
           else
             echo "::warning title=gate report (secrets in the history)::$s secret $(plural "$s" "finding|findings") in the full history: $(get secrets detail). Reported, not blocking on $EVENT. A rotated secret that stays in the history is ignored by its fingerprint in .gitleaksignore (docs/baseline.md)."
@@ -680,6 +820,16 @@ jobs:
               rows+="| $k | $what | reported (enforce: false) |"$'\n'
             fi
           done
+          # The baseline's own rules while they are reported only (docs/baseline.md, Baseline rules).
+          rs=$(get secrets reported); rs=${rs:-0}
+          rc=$(get sast reported); rc=${rc:-0}
+          if [ $((rs + rc)) -gt 0 ]; then
+            d=""
+            if [ "$rs" != 0 ]; then d=$(get secrets reported-detail); fi
+            if [ "$rc" != 0 ]; then d="${d:+$d; }$(get sast reported-detail)"; fi
+            echo "::warning title=gate report (baseline rules, baseline-rules: report)::$rs secret and $rc SAST $(plural "$((rs + rc))" "finding|findings") of the baseline's own rules (publicly known framework default passwords): $d. Not blocking: baseline-rules is report. Full list: $where, sections Secrets and SAST."
+            rows+="| baseline rules | secrets $rs, sast $rc | reported (baseline-rules: report) |"$'\n'
+          fi
           verdict=passed; [ "$fail" = 1 ] && verdict=failed
           summary "### Gate: $verdict" "" "| scanner | at or above the threshold | verdict |" "|---|---|---|"
           printf '%s' "$rows" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,4 @@
+OpenIddictDataSeedContributor.cs:3
+appsettings.json:12
+appsettings.json:6
+helm/values.yaml:2

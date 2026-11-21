@@ -174,7 +174,8 @@ GitHub-native extras for private consumer repos (push protection, CodeQL) need t
 Secret Protection / Code Security add-ons on the Team plan — **verify current pricing before
 deciding**; L1 does not depend on them.
 
-**Our Semgrep rule packs** (`rules/semgrep/<lang>/`), each rule with positive + negative fixtures:
+**Our Semgrep rule packs** (`rules/semgrep/`, fixtures in `tests/semgrep/`; the first ones, known framework default
+passwords, since 2026-11: docs/baseline.md, *Baseline rules*), each rule with positive + negative fixtures:
 
 - endpoint without an auth requirement (per framework idiom);
 - data access by id with no tenant/owner predicate (EF Core `Find` / `FirstOrDefault(x => x.Id == id)`,
@@ -319,7 +320,8 @@ pilot product.
 .github/workflows/      baseline.yml (reusable), probe.yml, audit.yml, release.yml
 .claude-plugin/         marketplace.json
 plugins/                security-audit/, variant-hunt/, add-invariant/, security-triage/
-rules/semgrep/          csharp/, java/, typescript/, react/ (+ tests/)
+rules/                  semgrep/, gitleaks/: our own rules, run by baseline.yml (docs/baseline.md, Baseline rules)
+tests/                  their fixtures (semgrep/, gitleaks/)
 kits/                   dotnet/, spring/, node-express/, react/
 probe/                  OpenAPI-driven CLI
 profiles/               JSON schema for security-profile.yml + examples
