@@ -3,7 +3,7 @@
 Every repository that calls `baseline.yml`, with the ref it calls (`v1`: the major tag, every v1 release; a SHA: one release). **This list is maintained by hand and must stay
 current** (see [CLAUDE.md](../CLAUDE.md)): it is how a release is rolled out and how a fix reaches every consumer.
 
-Last checked: **2026-11-27** (code search, see below). Current release: **v1.3.0** (`v1` points at it).
+Last checked: **2026-11-27** (code search, see below). `v1` points at the latest release ([Releases](https://github.com/expertni-sluzby/security-baseline/releases)).
 
 | Repository | Workflow | Ref | Runner (`runs-on`) | DefectDojo product |
 |---|---|---|---|---|

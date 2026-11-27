@@ -153,9 +153,10 @@ force-push/deletion; admin may merge own PR, never push directly), `release-tags
 only admins update or delete the major tag `v1`, which moves to every v1 release), `release-tags-creation` (only admins
 create `v*`); secret scanning + push protection + validity checks; Dependabot alerts and security
 updates; default `GITHUB_TOKEN` read-only; Actions on PRs from all external contributors need
-approval. **Not yet:** required signed commits (enable once maintainers sign); tag creation by
-the release workflow (GitHub does not allow the built-in Actions integration as a ruleset
-bypass actor — needs an org-installed GitHub App; until then an admin tags releases).
+approval. **Since 2026-11-27:** releases are created by `release.yml` through the GitHub App
+`expertni-sluzby-baseline-release` (Contents write on this repository only; the built-in Actions integration cannot be
+a ruleset bypass actor), the bypass actor of `release-tags-creation` and `major-tags`; key in the environment
+`release` (main only). **Not yet:** required signed commits (enable once maintainers sign).
 
 ## 7. Layer details
 
