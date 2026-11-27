@@ -56,8 +56,9 @@ move to in a pull request.
 
 **Releasing** happens on GitHub: a pull request adds `releases/vX.Y.Z.md` (first line the title, the rest the notes,
 both in Czech; [releases/README.md](../releases/README.md)). The code owner's review covers the change and the release.
-After the merge, `self-test.yml` runs the baseline on main and, once it passed, calls `release.yml`, which creates the
-release at that commit and moves `v1`. A pull request without such a file releases nothing. Tags are created and moved
+The push of the merge to main starts `release.yml`: it waits until the self-test gate passed on that commit, creates
+the release there and moves `v1`. A pull request without such a file releases nothing; `release=x.y.z` by hand
+releases an existing file at the head of main. Tags are created and moved
 by the GitHub App `expertni-sluzby-baseline-release` (Contents write on this repository only), the bypass actor of the
 rulesets `release-tags-creation` and `major-tags`; its key is a secret of the environment `release` (main only).
 

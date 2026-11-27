@@ -24,12 +24,3 @@ jobs:
       # Pull requests scan the changes (the default diff), pushes to main the whole repository: both paths of the
       # sast job run here.
       sast-push: full
-
-  # A push to main that adds releases/vX.Y.Z.md releases that commit once the baseline above passed on it
-  # (release.yml; docs/baseline.md, Versions). Any other push: the job finds nothing to release.
-  release:
-    needs: baseline
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    uses: ./.github/workflows/release.yml
-    permissions:
-      contents: read
