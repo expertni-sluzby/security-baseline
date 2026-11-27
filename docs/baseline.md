@@ -54,13 +54,16 @@ Because a v1 release reaches everyone at once, it may:
 It never removes or renames an input, an output or the check `baseline / gate`: that is v2, a new tag that consumers
 move to in a pull request.
 
-**Releasing** is `scripts/release.sh release <x.y.z> <notes.md> "<title>"` (an admin; `--dry-run` shows what it would
-do): it checks that the self-test gate of `origin/main` passed and that the version is newer, creates the release,
-moves `v1`, opens the pull request for *Current release* in [consumers.md](consumers.md) and lists the ref every
-consumer calls. `scripts/release.sh status` shows the same without changing anything.
+**Releasing** happens on GitHub: a pull request adds `releases/vX.Y.Z.md` (first line the title, the rest the notes,
+both in Czech; [releases/README.md](../releases/README.md)). The code owner's review covers the change and the release.
+After the merge, `self-test.yml` runs the baseline on main and, once it passed, calls `release.yml`, which creates the
+release at that commit and moves `v1`. A pull request without such a file releases nothing. Tags are created and moved
+by the GitHub App `expertni-sluzby-baseline-release` (Contents write on this repository only), the bypass actor of the
+rulesets `release-tags-creation` and `major-tags`; its key is a secret of the environment `release` (main only).
 
-**Rollback:** `scripts/release.sh rollback <x.y.z>` moves `v1` back to that release; consumers get it at their next
-run.
+**Rollback:** Actions → release → Run workflow with `rollback: x.y.z` (`gh workflow run release.yml -f rollback=1.3.0`)
+moves `v1` back to that release; consumers get it at their next run. `scripts/release.sh status` shows the releases,
+where `v1` points and the ref every consumer calls; its `release` and `rollback` are an admin's fallback.
 
 zizmor reports a reusable workflow called by a tag as `unpinned-uses` (high). The baseline drops that one finding for
 its own `.../baseline.yml@vN`; every other unpinned reference stays a finding.

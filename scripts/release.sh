@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Release security-baseline and move its major tag, so that every consumer runs the new version at its next run
-# (docs/baseline.md, Versions). Run by an admin of the repository: only admins create v* tags and move v1 (rulesets
-# release-tags-creation and major-tags). Needs gh (signed in), git and jq.
+# Releases normally happen on GitHub: a pull request adds releases/vX.Y.Z.md and release.yml releases the merge
+# (docs/baseline.md, Versions). This script shows the state (status) and is an admin's fallback for release and
+# rollback when Actions cannot do it (only admins and the release App create v* tags and move v1). Needs gh, git, jq.
 #
 #   scripts/release.sh status
 #       releases, where the major tag points, the ref every consumer calls
 #   scripts/release.sh release <x.y.z> <notes.md> "<title>" [--dry-run] [--yes]
-#       release the head of origin/main as vX.Y.Z (notes in Czech, title without the version), move vX to it,
-#       open the pull request that updates "Current release" in docs/consumers.md
+#       release the head of origin/main as vX.Y.Z (notes in Czech, title without the version), move vX to it
 #   scripts/release.sh rollback <x.y.z> [--dry-run] [--yes]
 #       move the major tag back to an existing release
 #
@@ -127,25 +126,8 @@ release() {
   [ "$(commit_of "$tag")" = "$sha" ] || die "$tag was not created at $sha"
   echo "  $tag -> ${sha:0:7} ($(gh release view "$tag" --repo "$REPO" --json url --jq .url))"
   move_major "$major" "$sha"
-  consumers_pr "$tag" "$major"
   say "consumers (ref they call); a consumer that pins a SHA does not get $tag until it moves its pin"
   consumers
-}
-
-consumers_pr() { # <tag> <major>: "Current release" in docs/consumers.md, through a pull request (main is protected)
-  local tag=$1 major=$2 branch="docs/consumers-$1" today
-  today=$(date -u +%Y-%m-%d)
-  git switch -q -c "$branch" origin/main
-  sed -i -E "s/^Last checked: \*\*[0-9-]+\*\*(.*)Current release: \*\*v[0-9.]+\*\*( \(\`v[0-9]+\` points at it\))?\./Last checked: **$today**\1Current release: **$tag** (\`$major\` points at it)./" docs/consumers.md
-  if git diff --quiet docs/consumers.md; then
-    echo "  docs/consumers.md: \"Current release\" line not found or unchanged; update it by hand"
-  else
-    git commit -q -m "docs(consumers): $tag is the current release ($major points at it)" docs/consumers.md
-    git push -q -u origin "$branch"
-    gh pr create --repo "$REPO" --head "$branch" --title "docs(consumers): $tag is the current release" \
-      --body "Released $tag; \`$major\` points at it, so every consumer on \`@$major\` runs it at its next run. Opened by scripts/release.sh." | sed 's/^/  /'
-  fi
-  git switch -q -
 }
 
 rollback() {

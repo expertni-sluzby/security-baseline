@@ -22,8 +22,8 @@ same piece of work as the change that makes it stale:**
 
 - a repository starts or stops using the baseline, or changes its runner or DefectDojo product: update its row;
 - a consumer moves its pin: update the pin in its row;
-- a release here: `scripts/release.sh release …` (creates the release, moves `v1`, opens the pull request for
-  "Current release" and lists the consumers' refs); note which consumers pin an older SHA, and before tagging re-run the code search
-  in `docs/consumers.md` to find consumers the list misses.
+- a release here: the pull request adds `releases/vX.Y.Z.md` (releases/README.md); after the merge `release.yml`
+  creates the release and moves `v1`. Before that, re-run the code search in `docs/consumers.md` (or
+  `scripts/release.sh status`) to find consumers the list misses and those that pin an older SHA.
 
 A pull request that releases a version or changes a consumer without updating the list is not finished.
