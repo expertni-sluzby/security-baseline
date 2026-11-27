@@ -724,6 +724,33 @@ jobs:
           set -e
           # zizmor exits non-zero when it reports findings (10-14); only a crash (other codes) fails here.
           case "$rc" in 0|1[0-4]) ;; *) echo "zizmor failed with exit code $rc"; exit "$rc" ;; esac
+          # Calling the baseline through its major tag (.../baseline.yml@v1) is the documented way (docs/baseline.md,
+          # Versions); zizmor reports it as unpinned-uses (high). That finding is dropped for exactly this reference: the
+          # baseline's own workflow at a major tag vN. Every other unpinned reference stays a finding.
+          python3 -I - reports/zizmor.sarif <<'PY'
+          import json, re, sys
+          path = sys.argv[1]
+          sarif = json.load(open(path))
+          own = re.compile(r"^\s*(-\s*)?uses:\s*['\"]?expertni-sluzby/security-baseline/\.github/workflows/baseline\.yml@v[0-9]+['\"]?\s*(#.*)?$")
+          dropped = 0
+          for run in sarif.get("runs", []):
+              kept = []
+              for result in run.get("results", []):
+                  if result.get("ruleId") == "zizmor/unpinned-uses":
+                      loc = result["locations"][0]["physicalLocation"]
+                      uri = loc["artifactLocation"]["uri"].removeprefix("file://")
+                      try:
+                          line = open(uri, encoding="utf-8").read().splitlines()[loc["region"]["startLine"] - 1]
+                      except (OSError, IndexError, KeyError):
+                          line = ""
+                      if own.match(line):
+                          dropped += 1
+                          continue
+                  kept.append(result)
+              run["results"] = kept
+          json.dump(sarif, open(path, "w"))
+          print(f"unpinned-uses for the baseline's own major tag: {dropped} dropped")
+          PY
       - id: verdict
         name: Verdict
         env:

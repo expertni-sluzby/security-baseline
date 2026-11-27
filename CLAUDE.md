@@ -9,8 +9,9 @@ it secrets, so it is a supply-chain target (`docs/PLAN.md` §6).
 - Scanners are pinned by version **and** sha256 (Semgrep: an image by digest, through the company Harbor's proxy of
   Docker Hub), actions by commit SHA; versions are at least 14 days old when pinned. No third-party scanner actions, no
   `${{ }}` inside `run:`, no `pull_request_target`, minimal `permissions:`.
-- `main` takes changes only through pull requests reviewed by the code owner (ruleset `main-protection`). Tags `v*` are
-  immutable. Versioning is semver: a rule change that can newly fail consumers' builds is a minor bump, a contract change
+- `main` takes changes only through pull requests reviewed by the code owner (ruleset `main-protection`). Release tags `v*.*.*` are
+  immutable; the major tag `v1` moves to every v1 release (only admins, ruleset `major-tags`), see docs/baseline.md,
+  *Versions*: a v1 release reaches every consumer at once, so it never newly blocks without a report-only release first. Versioning is semver: a rule change that can newly fail consumers' builds is a minor bump, a contract change
   is a major bump. Every tag gets a GitHub release with notes in Czech, like the existing ones.
 - Docs are in English.
 
@@ -21,7 +22,7 @@ same piece of work as the change that makes it stale:**
 
 - a repository starts or stops using the baseline, or changes its runner or DefectDojo product: update its row;
 - a consumer moves its pin: update the pin in its row;
-- a release here: update "Current release", note which consumers are behind, and before tagging re-run the code search
+- a release here: move `v1` to the release commit, update "Current release", note which consumers pin an older SHA, and before tagging re-run the code search
   in `docs/consumers.md` to find consumers the list misses.
 
 A pull request that releases a version or changes a consumer without updating the list is not finished.

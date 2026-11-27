@@ -1,6 +1,6 @@
 # Consumers
 
-Every repository that calls `baseline.yml`, with the version it pins. **This list is maintained by hand and must stay
+Every repository that calls `baseline.yml`, with the ref it calls (`v1`: the major tag, every v1 release; a SHA: one release). **This list is maintained by hand and must stay
 current** (see [CLAUDE.md](../CLAUDE.md)): it is how a release is rolled out and how a fix reaches every consumer.
 
 Last checked: **2026-11-27** (code search, see below). Current release: **v1.2.0**.
