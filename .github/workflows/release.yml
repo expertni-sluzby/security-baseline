@@ -1,23 +1,31 @@
 # Releases the baseline (docs/baseline.md, Versions).
 #
-# - Release: a pull request adds releases/vX.Y.Z.md (first line the title, the rest the notes, both in Czech). After the
-#   merge, self-test.yml runs the baseline on main and, once it passed, calls this workflow: it creates the release
-#   vX.Y.Z at that commit and moves the major tag vX to it. Every consumer on @vX runs it at its next run.
-# - Rollback: run this workflow by hand (Actions -> release -> Run workflow, or
-#   `gh workflow run release.yml -f rollback=1.3.0`): it moves the major tag back to an existing release.
+# - Release: a pull request adds releases/vX.Y.Z.md (first line the title, the rest the notes, both in Czech). The push
+#   of the merge to main starts this workflow; it waits until the self-test gate passed on that commit, creates the
+#   release vX.Y.Z there and moves the major tag vX to it. Every consumer on @vX runs it at its next run.
+# - By hand (Actions -> release -> Run workflow, or gh workflow run release.yml -f ...):
+#   `release=x.y.z` releases releases/vX.Y.Z.md at the head of main (when the automatic run could not),
+#   `rollback=x.y.z` moves the major tag back to an existing release.
 #
 # Tags are created and moved by the GitHub App expertni-sluzby-baseline-release, the bypass actor of the rulesets
 # release-tags-creation and major-tags (the built-in Actions token cannot be one). Its key is a secret of the
-# environment `release`, which only main may use. Nothing from `${{ }}` is interpolated into a `run:` script.
+# environment `release`, which only main may use (a standalone workflow: a reusable one called from self-test.yml did
+# not get the environment's secret). Nothing from `${{ }}` is interpolated into a `run:` script.
 name: release
 
 on:
-  workflow_call:
+  push:
+    branches: [main]
+    paths: ["releases/v*.md"]
   workflow_dispatch:
     inputs:
+      release:
+        description: "Release releases/vX.Y.Z.md at the head of main (x.y.z); leave empty for a rollback"
+        required: false
+        type: string
       rollback:
-        description: "Move the major tag back to this existing release (x.y.z)"
-        required: true
+        description: "Move the major tag back to this existing release (x.y.z); leave empty for a release"
+        required: false
         type: string
 
 permissions: {}
@@ -33,6 +41,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
+      checks: read
     steps:
       - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
         with:
@@ -48,6 +57,7 @@ jobs:
           REF: ${{ github.ref }}
           BEFORE: ${{ github.event.before }}
           SHA: ${{ github.sha }}
+          RELEASE: ${{ inputs.release }}
           ROLLBACK: ${{ inputs.rollback }}
         run: |
           set -euo pipefail
@@ -56,7 +66,11 @@ jobs:
             echo "::error title=release::Only main releases (ref $REF)."
             exit 1
           fi
-          if [ "$EVENT" = workflow_dispatch ]; then
+          if [ "$EVENT" = workflow_dispatch ] && { [ -n "$RELEASE" ] && [ -n "$ROLLBACK" ] || [ -z "$RELEASE$ROLLBACK" ]; }; then
+            echo "::error title=release (invalid input)::Set exactly one of release and rollback."
+            exit 1
+          fi
+          if [ "$EVENT" = workflow_dispatch ] && [ -n "$ROLLBACK" ]; then
             if ! printf '%s' "$ROLLBACK" | grep -Eqx "$semver"; then
               echo "::error title=release (invalid input)::rollback is '$ROLLBACK'; it takes a release x.y.z."
               exit 1
@@ -69,11 +83,19 @@ jobs:
             fi
             mode=rollback
           else
-            base="$BEFORE"
-            if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
-              base=$(git rev-parse "$SHA^")
+            if [ "$EVENT" = workflow_dispatch ]; then
+              added="releases/v$RELEASE.md"
+              if ! printf '%s' "$RELEASE" | grep -Eqx "$semver" || [ ! -f "$added" ]; then
+                echo "::error title=release (invalid input)::release is '$RELEASE'; it takes x.y.z with releases/vX.Y.Z.md on main."
+                exit 1
+              fi
+            else
+              base="$BEFORE"
+              if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
+                base=$(git rev-parse "$SHA^")
+              fi
+              added=$(git diff --no-renames --diff-filter=A --name-only "$base" "$SHA" -- 'releases/v*.md')
             fi
-            added=$(git diff --no-renames --diff-filter=A --name-only "$base" "$SHA" -- 'releases/v*.md')
             if [ -z "$added" ]; then
               echo "No releases/vX.Y.Z.md added by this push: nothing to release."
               echo "mode=none" >> "$GITHUB_OUTPUT"
@@ -123,6 +145,26 @@ jobs:
             echo "target=$target"
           } >> "$GITHUB_OUTPUT"
           echo "$mode: $tag at $target, major tag $major"
+      - name: Wait for the self-test gate on this commit
+        if: steps.plan.outputs.mode == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TARGET: ${{ steps.plan.outputs.target }}
+        run: |
+          set -euo pipefail
+          # The baseline must have passed on exactly the commit that is released (self-test.yml, job baseline / gate).
+          for _ in $(seq 1 90); do
+            state=$(gh api "repos/$REPO/commits/$TARGET/check-runs?check_name=baseline%20%2F%20gate&per_page=20" \
+              --jq '[.check_runs[] | select(.app.slug == "github-actions")] | if length == 0 then "missing" elif all(.status == "completed") then (if any(.conclusion == "success") then "success" else "failure" end) else "running" end') || state=api-error
+            case "$state" in
+              success) echo "self-test gate passed on $TARGET"; exit 0 ;;
+              failure) echo "::error title=release::The self-test gate failed on $TARGET; nothing is released."; exit 1 ;;
+            esac
+            sleep 20
+          done
+          echo "::error title=release::The self-test gate did not finish on $TARGET within 30 minutes; nothing is released."
+          exit 1
       - id: token
         if: steps.plan.outputs.mode != 'none'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
