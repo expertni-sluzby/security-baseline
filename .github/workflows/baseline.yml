@@ -60,6 +60,26 @@ on:
           runners; Harden-Runner only audits on GitHub-hosted runners.
         type: string
         default: '"ubuntu-24.04"'
+      sast-pull-request:
+        description: >-
+          What Semgrep scans on a pull request. "diff" (the default): only the files the pull request changes,
+          compared with its base (semgrep --baseline-commit), and only findings the pull request introduces count.
+          "full": the whole repository at the pull request's head. Scheduled and manual runs always scan the whole
+          repository. See docs/baseline.md, "SAST scope".
+        type: string
+        default: diff
+      sast-push:
+        description: >-
+          What Semgrep scans on a push. "off" (the default): nothing; the scheduled run scans the whole repository and
+          is what DefectDojo records. "full": the whole repository.
+        type: string
+        default: "off"
+      sast-jobs:
+        description: >-
+          Semgrep worker processes (semgrep --jobs), each about one CPU. Without it Semgrep starts one per CPU it sees,
+          on a shared runner node all of the node's CPUs.
+        type: number
+        default: 2
     secrets:
       DEFECTDOJO_TOKEN:
         required: false
@@ -102,6 +122,9 @@ jobs:
     name: secrets (gitleaks + trufflehog)
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 20
+    concurrency:
+      group: ${{ github.event_name == 'pull_request' && format('{0}-{1}-baseline-secrets', github.workflow, github.ref) || format('{0}-baseline-secrets-{1}', github.workflow, github.run_id) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
     outputs:
@@ -286,6 +309,9 @@ jobs:
     name: dependencies (osv-scanner)
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 20
+    concurrency:
+      group: ${{ github.event_name == 'pull_request' && format('{0}-{1}-baseline-dependencies', github.workflow, github.ref) || format('{0}-baseline-dependencies-{1}', github.workflow, github.run_id) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
     outputs:
@@ -395,6 +421,9 @@ jobs:
     name: iac (trivy config)
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 20
+    concurrency:
+      group: ${{ github.event_name == 'pull_request' && format('{0}-{1}-baseline-iac', github.workflow, github.ref) || format('{0}-baseline-iac-{1}', github.workflow, github.run_id) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
     outputs:
@@ -467,6 +496,9 @@ jobs:
     name: sast (semgrep)
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 30
+    concurrency:
+      group: ${{ github.event_name == 'pull_request' && format('{0}-{1}-baseline-sast', github.workflow, github.ref) || format('{0}-baseline-sast-{1}', github.workflow, github.run_id) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
     outputs:
@@ -478,11 +510,52 @@ jobs:
       - uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
         with:
           egress-policy: audit
+      # Depth 2: on a pull request HEAD is GitHub's merge commit, and its first parent is the base that a diff scan
+      # compares with.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
+      - id: scope
+        name: Scope (sast-pull-request, sast-push)
+        env:
+          EVENT: ${{ github.event_name }}
+          SAST_PR: ${{ inputs.sast-pull-request }}
+          SAST_PUSH: ${{ inputs.sast-push }}
+          SAST_JOBS: ${{ inputs.sast-jobs }}
+        run: |
+          set -euo pipefail
+          # A value this job does not know fails it, and the gate fails with it: unknown never passes.
+          if [ "$SAST_PR" != diff ] && [ "$SAST_PR" != full ]; then
+            echo "::error title=sast (invalid input)::sast-pull-request is '$SAST_PR'; it takes diff or full (docs/baseline.md)."
+            exit 1
+          fi
+          if [ "$SAST_PUSH" != off ] && [ "$SAST_PUSH" != full ]; then
+            echo "::error title=sast (invalid input)::sast-push is '$SAST_PUSH'; it takes off or full (docs/baseline.md)."
+            exit 1
+          fi
+          if ! printf '%s' "$SAST_JOBS" | grep -Eqx '[1-9][0-9]*'; then
+            echo "::error title=sast (invalid input)::sast-jobs is '$SAST_JOBS'; it takes a whole number from 1."
+            exit 1
+          fi
+          mode=full; baseline=""
+          if [ "$EVENT" = pull_request ] && [ "$SAST_PR" = diff ]; then
+            # GitHub's merge commit has two parents; without the second one (an unusual checkout) there is no base to
+            # compare with, and the whole repository is scanned instead.
+            if git rev-parse -q --verify HEAD^2 >/dev/null; then
+              mode=diff; baseline=$(git rev-parse HEAD^1)
+            else
+              echo "::notice title=sast scope::HEAD is not a merge commit, so there is no base to compare with; scanning the whole repository."
+            fi
+          elif [ "$EVENT" = push ] && [ "$SAST_PUSH" = off ]; then
+            mode=off
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "sast: $mode, base '$baseline', $SAST_JOBS jobs"
       # The same two steps in the secrets job.
       - name: Check out the baseline's rules (the commit of this workflow)
+        if: steps.scope.outputs.mode != 'off'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ job.workflow_repository }}
@@ -493,6 +566,7 @@ jobs:
             tests
           persist-credentials: false
       - name: Move the rules out of the scanned tree
+        if: steps.scope.outputs.mode != 'off'
         env:
           WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
@@ -505,29 +579,45 @@ jobs:
           fi
           mv .security-baseline "$RUNNER_TEMP/security-baseline"
       - name: Test the baseline's Semgrep rules (only when the baseline tests itself)
-        if: github.repository == job.workflow_repository
+        if: github.repository == job.workflow_repository && steps.scope.outputs.mode != 'off'
         run: |
           set -euo pipefail
           docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$RUNNER_TEMP/security-baseline:/baseline:ro" -w /baseline "$SEMGREP_IMAGE" \
             semgrep scan --test --metrics off --disable-version-check --config rules/semgrep/ tests/semgrep/
       - name: semgrep (pinned image digest, metrics off)
+        if: steps.scope.outputs.mode != 'off'
+        env:
+          BASELINE: ${{ steps.scope.outputs.baseline }}
+          SAST_JOBS: ${{ inputs.sast-jobs }}
         run: |
           set -euo pipefail
           mkdir -p reports
+          # diff: Semgrep scans the files changed against the base and keeps only findings the base does not have
+          # (it reads the base from the repository's git history, hence the depth-2 checkout).
+          diff=(); [ -n "$BASELINE" ] && diff=(--baseline-commit "$BASELINE")
           # p/default and the baseline's own rules. Mounted at /security-baseline, their rule IDs read
           # security-baseline.<rule> (in nosemgrep comments the <rule> alone is enough).
           docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" \
             -v "$RUNNER_TEMP/security-baseline/rules/semgrep:/security-baseline:ro" -w /src "$SEMGREP_IMAGE" \
             semgrep scan --config p/default --config /security-baseline --metrics off --disable-version-check \
-            --json --output reports/semgrep.json .
+            --jobs "$SAST_JOBS" "${diff[@]}" --json --output reports/semgrep.json .
       - id: verdict
         name: Verdict
         env:
           FAIL_ON: ${{ inputs.fail-on }}
           ENFORCE: ${{ inputs.enforce }}
           BASELINE_RULES: ${{ inputs.baseline-rules }}
+          MODE: ${{ steps.scope.outputs.mode }}
+          BASELINE: ${{ steps.scope.outputs.baseline }}
         run: |
           set -euo pipefail
+          if [ "$MODE" = off ]; then
+            for o in blocking reported; do echo "$o=0" >> "$GITHUB_OUTPUT"; done
+            for o in detail reported-detail; do echo "$o=" >> "$GITHUB_OUTPUT"; done
+            { echo "### SAST"; echo "Not run on a push (sast-push: off); the scheduled run scans the whole repository."; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          scope="the whole repository"; [ "$MODE" = diff ] && scope="the files changed against \`${BASELINE:0:7}\`, findings new in this pull request (sast-pull-request: diff)"
           # Rules use either ERROR/WARNING/INFO or LOW..CRITICAL; ERROR counts as high.
           sev='["ERROR","HIGH","CRITICAL"]'; threshold=ERROR/HIGH; [ "$FAIL_ON" = critical ] && { sev='["CRITICAL"]'; threshold=CRITICAL; }
           level=warning; [ "$ENFORCE" = true ] && level=error
@@ -558,6 +648,7 @@ jobs:
             | .title = "sast: \(.id) \(.sev) (baseline-rules: report)" | .msg = "\(.msg[:300]) \(.url)" | annotation("warning")' findings.json
           {
             echo "### SAST"
+            echo "Scanned: $scope."
             echo "$total results in total, $n at or above $threshold ($errors scan errors)."
             if [ "$n" != 0 ]; then
               echo
@@ -582,6 +673,7 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.scope.outputs.mode != 'off'
         with:
           name: baseline-sast
           path: reports/
@@ -591,6 +683,9 @@ jobs:
     name: workflows (zizmor)
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 10
+    concurrency:
+      group: ${{ github.event_name == 'pull_request' && format('{0}-{1}-baseline-workflows', github.workflow, github.ref) || format('{0}-baseline-workflows-{1}', github.workflow, github.run_id) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
     outputs:
@@ -746,6 +841,9 @@ jobs:
     needs: [secrets, dependencies, iac, sast, workflows]
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 5
+    concurrency:
+      group: ${{ github.event_name == 'pull_request' && format('{0}-{1}-baseline-gate', github.workflow, github.ref) || format('{0}-baseline-gate-{1}', github.workflow, github.run_id) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     permissions: {}
     steps:
       - name: Decide
@@ -838,7 +936,7 @@ jobs:
             printf '%s' "$blocked" >> "$GITHUB_STEP_SUMMARY"
           fi
           if [ "$fail" = 1 ] && [ "$EVENT" = pull_request ]; then
-            note="The scanners look at the whole repository at this pull request's head, not only at its changes, so a blocking finding may predate the pull request (an advisory published yesterday blocks every branch today). Fix it here, or merge the fix to the base branch and update this branch."
+            note="The scanners look at the whole repository at this pull request's head, not only at its changes (SAST too unless sast-pull-request is diff, the default), so a blocking finding may predate the pull request (an advisory published yesterday blocks every branch today). Fix it here, or merge the fix to the base branch and update this branch."
             echo "::notice title=gate scope::$note"
             summary "" "$note"
           fi
