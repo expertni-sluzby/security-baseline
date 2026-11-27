@@ -149,8 +149,9 @@ marketplace with one command.
 
 **Applied 2026-10-20:** CODEOWNERS; rulesets `main-protection` (PR + code-owner review, no
 force-push/deletion; admin may merge own PR, never push directly), `release-tags-immutable`
-(`v*` cannot be updated or deleted — no bypass), `release-tags-creation` (only admins create
-`v*`); secret scanning + push protection + validity checks; Dependabot alerts and security
+(`v*.*.*` cannot be updated or deleted — no bypass; since 2026-11-27, before that `v*`), `major-tags` (since 2026-11-27:
+only admins update or delete the major tag `v1`, which moves to every v1 release), `release-tags-creation` (only admins
+create `v*`); secret scanning + push protection + validity checks; Dependabot alerts and security
 updates; default `GITHUB_TOKEN` read-only; Actions on PRs from all external contributors need
 approval. **Not yet:** required signed commits (enable once maintainers sign); tag creation by
 the release workflow (GitHub does not allow the built-in Actions integration as a ruleset

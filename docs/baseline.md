@@ -17,7 +17,7 @@ on:
 permissions: {}
 jobs:
   baseline:
-    uses: expertni-sluzby/security-baseline/.github/workflows/baseline.yml@v1
+    uses: expertni-sluzby/security-baseline/.github/workflows/baseline.yml@v1  # major tag: every v1.x release (see Versions)
     permissions:
       contents: read
     with:
@@ -33,8 +33,32 @@ Make the `baseline / gate` check required with a branch ruleset.
 
 ## Consumers
 
-The repositories that use this workflow and the version each one pins: [consumers.md](consumers.md). Adopting the
-baseline, moving a pin or dropping it means updating that list too.
+The repositories that use this workflow and the ref each one calls: [consumers.md](consumers.md). Adopting the
+baseline, changing the ref or dropping it means updating that list too.
+
+## Versions
+
+Consumers call the baseline through its major tag, `@v1`. Every v1.x.y release moves `v1` to the release commit, so a
+release reaches every consumer at its next run (pull request, push or the nightly run), with no change and no CI run in
+the consumer. The release tags `v1.x.y` never move (ruleset `release-tags-immutable`); only an admin moves `v1`
+(ruleset `major-tags`). A consumer that has to stay on one release pins its commit SHA with the release in a comment,
+as all consumers did before v1.3.0, and moves the pin in a pull request.
+
+Because a v1 release reaches everyone at once, it may:
+
+- fix, speed up or extend what is reported;
+- add inputs whose defaults keep the current behaviour or make it less strict;
+- add something that can newly **block** a consumer (a new rule, a stricter threshold, a new blocking scanner) only in
+  a reporting mode first (as `baseline-rules: report`), and make it blocking in a later release announced in advance.
+
+It never removes or renames an input, an output or the check `baseline / gate`: that is v2, a new tag that consumers
+move to in a pull request.
+
+**Rollback:** an admin moves `v1` back to the previous release (`git push -f origin <sha>:refs/tags/v1`); consumers get
+the previous version at their next run.
+
+zizmor reports a reusable workflow called by a tag as `unpinned-uses` (high). The baseline drops that one finding for
+its own `.../baseline.yml@vN`; every other unpinned reference stays a finding.
 
 ## Inputs
 
@@ -87,7 +111,7 @@ DefectDojo.
 Rules the baseline adds to its scanners, for classes of bugs that the generic rule sets miss. They live in
 [`rules/`](../rules) with their tests in [`tests/`](../tests), and the workflow checks them out from the commit of
 `baseline.yml` that is running (`job.workflow_repository` at `job.workflow_sha`): a consumer that pins a commit gets
-the rules of that commit, nothing newer. If they cannot be checked out at that commit, the job fails and so does the
+the rules of that commit, nothing newer; a consumer on `@v1` gets the rules of the release `v1` points at. If they cannot be checked out at that commit, the job fails and so does the
 gate.
 
 | Scanner | Rule ID | Severity | Finds |
@@ -121,17 +145,16 @@ or list the path in `.semgrepignore`.
 On a pull request the scanners look at the whole repository (Semgrep only with `sast-pull-request: full`), so a new
 rule would block every pull request of a consumer with an old finding of its kind until that finding is fixed. Therefore:
 
-1. A release that adds rules is a minor bump (PLAN.md §6.6) and changes no consumer by itself: each consumer pins a
-   commit and moves the pin in a pull request, which runs the new rules and shows their findings before anything is
-   merged.
+1. A release that adds rules is a minor bump (PLAN.md §6.6). Consumers on `@v1` run the new rules at their next run
+   (*Versions*), so a new rule must not block anyone at first; a consumer that pins a commit sees them in the pull
+   request that moves its pin.
 2. With `baseline-rules: report` (the default) the rules' findings are reported (annotations, the Summary page,
    DefectDojo) and never block. A consumer moves to the new release without fixing anything first.
 3. A consumer whose run shows no baseline-rule findings, or that has fixed or accepted them, sets
    `baseline-rules: enforce`.
 4. Once every consumer in [consumers.md](consumers.md) is on `enforce`, or has set `report` explicitly, a later minor
-   release, announced in advance, makes `enforce` the default. From then on a new rule reaches a consumer the same
-   way: the pull request that moves its pin shows the new findings, and the consumer fixes them there or sets
-   `report` until it has.
+   release, announced in advance, makes `enforce` the default. From then on a new rule that can block starts as
+   report-only for a release (announced), so that consumers on `@v1` see its findings before it blocks them.
 
 ### Tests
 
