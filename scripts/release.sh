@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Releases normally happen on GitHub: a pull request adds releases/vX.Y.Z.md and release.yml releases the merge
+# Releases normally happen on GitHub: a pull request changes releases/next.md and release.yml releases the merge
 # (docs/baseline.md, Versions). This script shows the state (status) and is an admin's fallback for release and
 # rollback when Actions cannot do it (only admins and the release App create v* tags and move v1). Needs gh, git, jq.
 #

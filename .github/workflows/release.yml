@@ -1,10 +1,12 @@
 # Releases the baseline (docs/baseline.md, Versions).
 #
-# - Release: a pull request adds releases/vX.Y.Z.md (first line the title, the rest the notes, both in Czech). The push
-#   of the merge to main starts this workflow; it waits until the self-test gate passed on that commit, creates the
-#   release vX.Y.Z there and moves the major tag vX to it. Every consumer on @vX runs it at its next run.
+# - Release: a pull request adds or changes releases/next.md (first line the title, the rest the notes, both in Czech).
+#   The push of the merge to main starts this workflow. It counts the version from the latest release: the commits
+#   since then decide (conventional commits: feat -> minor, anything else -> patch, "!"/BREAKING CHANGE -> v2, which is
+#   never automatic), or "patch:" / "minor:" at the start of the first line. It waits until the self-test gate passed
+#   on that commit, creates the release there and moves the major tag. Every consumer on @vX runs it at its next run.
 # - By hand (Actions -> release -> Run workflow, or gh workflow run release.yml -f ...):
-#   `release=x.y.z` releases releases/vX.Y.Z.md at the head of main (when the automatic run could not),
+#   `release=true` releases releases/next.md at the head of main (when the automatic run could not),
 #   `rollback=x.y.z` moves the major tag back to an existing release.
 #
 # Tags are created and moved by the GitHub App expertni-sluzby-baseline-release, the bypass actor of the rulesets
@@ -16,13 +18,14 @@ name: release
 on:
   push:
     branches: [main]
-    paths: ["releases/v*.md"]
+    paths: ["releases/next.md"]
   workflow_dispatch:
     inputs:
       release:
-        description: "Release releases/vX.Y.Z.md at the head of main (x.y.z); leave empty for a rollback"
+        description: "Release the notes in releases/next.md at the head of main (the version is counted as on a push)"
         required: false
-        type: string
+        type: boolean
+        default: false
       rollback:
         description: "Move the major tag back to this existing release (x.y.z); leave empty for a release"
         required: false
@@ -62,15 +65,36 @@ jobs:
         run: |
           set -euo pipefail
           semver='^[0-9]+\.[0-9]+\.[0-9]+$'
+          next=releases/next.md
           if [ "$REF" != refs/heads/main ]; then
             echo "::error title=release::Only main releases (ref $REF)."
             exit 1
           fi
-          if [ "$EVENT" = workflow_dispatch ] && { [ -n "$RELEASE" ] && [ -n "$ROLLBACK" ] || [ -z "$RELEASE$ROLLBACK" ]; }; then
-            echo "::error title=release (invalid input)::Set exactly one of release and rollback."
-            exit 1
+          latest=$(git tag -l 'v*.*.*' | sort -V | tail -1)
+          mode=release
+          if [ "$EVENT" = workflow_dispatch ]; then
+            if [ "$RELEASE" = true ] && [ -n "$ROLLBACK" ]; then
+              echo "::error title=release (invalid input)::Either release or rollback, not both."
+              exit 1
+            fi
+            if [ -n "$ROLLBACK" ]; then
+              mode=rollback
+            elif [ "$RELEASE" != true ]; then
+              echo "::error title=release (invalid input)::Set release (the notes in $next at the head of main) or rollback (x.y.z)."
+              exit 1
+            fi
+          else
+            base="$BEFORE"
+            if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
+              base=$(git rev-parse "$SHA^")
+            fi
+            if [ -z "$(git diff --no-renames --diff-filter=AM --name-only "$base" "$SHA" -- "$next")" ]; then
+              echo "This push does not add or change $next: nothing to release."
+              echo "mode=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
-          if [ "$EVENT" = workflow_dispatch ] && [ -n "$ROLLBACK" ]; then
+          if [ "$mode" = rollback ]; then
             if ! printf '%s' "$ROLLBACK" | grep -Eqx "$semver"; then
               echo "::error title=release (invalid input)::rollback is '$ROLLBACK'; it takes a release x.y.z."
               exit 1
@@ -81,70 +105,73 @@ jobs:
               echo "::error title=release::$tag is not a release."
               exit 1
             fi
-            mode=rollback
+            reason="rollback"
           else
-            if [ "$EVENT" = workflow_dispatch ]; then
-              added="releases/v$RELEASE.md"
-              if ! printf '%s' "$RELEASE" | grep -Eqx "$semver" || [ ! -f "$added" ]; then
-                echo "::error title=release (invalid input)::release is '$RELEASE'; it takes x.y.z with releases/vX.Y.Z.md on main."
-                exit 1
-              fi
+            if [ ! -s "$next" ]; then
+              echo "::error title=release::$next is missing or empty."
+              exit 1
+            fi
+            if [ -z "$latest" ]; then
+              echo "::error title=release::No release v*.*.* to count from."
+              exit 1
+            fi
+            if [ "$(git rev-list --count "$latest..$SHA")" -eq 0 ]; then
+              echo "::error title=release::Nothing new since $latest."
+              exit 1
+            fi
+            first=$(sed -n '1{s/^#*[[:space:]]*//;p;q}' "$next")
+            bump=""
+            title="$first"
+            # An explicit "patch:" or "minor:" on the first line wins; otherwise the commits since the latest release
+            # decide (conventional commits): feat -> minor, anything else -> patch, "!" or BREAKING CHANGE -> v2.
+            if printf '%s' "$first" | grep -Eq '^(patch|minor|major):'; then
+              bump="${first%%:*}"
+              title=$(printf '%s' "${first#*:}" | sed 's/^[[:space:]]*//')
+              reason="first line of $next"
             else
-              base="$BEFORE"
-              if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
-                base=$(git rev-parse "$SHA^")
+              log=$(git log --no-merges --format='%s%n%b' "$latest..$SHA")
+              if printf '%s\n' "$log" | grep -Eq '^[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE'; then
+                bump=major
+              elif printf '%s\n' "$log" | grep -Eq '^feat(\([^)]*\))?:'; then
+                bump=minor
+              else
+                bump=patch
               fi
-              added=$(git diff --no-renames --diff-filter=A --name-only "$base" "$SHA" -- 'releases/v*.md')
+              reason="commits since $latest"
             fi
-            if [ -z "$added" ]; then
-              echo "No releases/vX.Y.Z.md added by this push: nothing to release."
-              echo "mode=none" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            if [ "$(printf '%s\n' "$added" | wc -l)" -ne 1 ]; then
-              echo "::error title=release::One release per push; this one adds: $(printf '%s ' "$added")"
+            if [ "$bump" = major ]; then
+              echo "::error title=release::A breaking change ($reason) is v2: a new major tag that consumers move to in a pull request (docs/baseline.md, Versions); not released automatically."
               exit 1
             fi
-            file="$added"
-            name=$(basename "$file" .md)
-            ver="${name#v}"
-            if [ "$name" = "$ver" ] || ! printf '%s' "$ver" | grep -Eqx "$semver"; then
-              echo "::error file=$file,title=release::The file name is releases/vX.Y.Z.md."
-              exit 1
-            fi
-            tag="v$ver"
-            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-              echo "::error file=$file,title=release::$tag exists already; tags v*.*.* are immutable."
-              exit 1
-            fi
-            latest=$(git tag -l 'v*.*.*' | sort -V | tail -1)
-            if [ -n "$latest" ] && [ "$(printf '%s\n%s\n' "$latest" "$tag" | sort -V | tail -1)" != "$tag" ]; then
-              echo "::error file=$file,title=release::$tag is not newer than $latest."
-              exit 1
-            fi
-            title=$(sed -n '1{s/^#*[[:space:]]*//;p;q}' "$file")
             if [ -z "$title" ]; then
-              echo "::error file=$file,line=1,title=release::The first line is the title."
+              echo "::error file=$next,line=1,title=release::The first line is the title."
               exit 1
             fi
-            sed '1d' "$file" | sed '/./,$!d' > "$RUNNER_TEMP/notes.md"
+            sed '1d' "$next" | sed '/./,$!d' > "$RUNNER_TEMP/notes.md"
             if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
-              echo "::error file=$file,title=release::The notes (after the first line) are empty."
+              echo "::error file=$next,title=release::The notes (after the first line) are empty."
+              exit 1
+            fi
+            IFS=. read -r ma mi pa <<< "${latest#v}"
+            if [ "$bump" = minor ]; then mi=$((mi + 1)); pa=0; else pa=$((pa + 1)); fi
+            tag="v$ma.$mi.$pa"
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "::error title=release::$tag exists already."
               exit 1
             fi
             printf '%s — %s' "$tag" "$title" > "$RUNNER_TEMP/title.txt"
             target="$SHA"
-            mode=release
+            reason="$bump from $latest ($reason)"
           fi
-          major="v${tag#v}"
-          major="${major%%.*}"
+          major="${tag%%.*}"
           {
             echo "mode=$mode"
             echo "tag=$tag"
             echo "major=$major"
             echo "target=$target"
+            echo "reason=$reason"
           } >> "$GITHUB_OUTPUT"
-          echo "$mode: $tag at $target, major tag $major"
+          echo "$mode: $tag at $target, major tag $major ($reason)"
       - name: Wait for the self-test gate on this commit
         if: steps.plan.outputs.mode == 'release'
         env:
@@ -182,6 +209,7 @@ jobs:
           TAG: ${{ steps.plan.outputs.tag }}
           MAJOR: ${{ steps.plan.outputs.major }}
           TARGET: ${{ steps.plan.outputs.target }}
+          REASON: ${{ steps.plan.outputs.reason }}
         run: |
           set -euo pipefail
           if [ "$MODE" = release ]; then
@@ -202,7 +230,7 @@ jobs:
           fi
           {
             echo "### Release"
-            if [ "$MODE" = release ]; then echo "Released **$TAG** at \`${TARGET:0:7}\`."; else echo "Rolled back to **$TAG** \`${TARGET:0:7}\`."; fi
+            if [ "$MODE" = release ]; then echo "Released **$TAG** at \`${TARGET:0:7}\` ($REASON)."; else echo "Rolled back to **$TAG** \`${TARGET:0:7}\`."; fi
             echo
             echo "\`$MAJOR\`: \`${before:0:7}\` → \`${TARGET:0:7}\`. Every consumer on \`@$MAJOR\` runs it at its next run."
           } >> "$GITHUB_STEP_SUMMARY"

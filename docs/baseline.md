@@ -54,11 +54,12 @@ Because a v1 release reaches everyone at once, it may:
 It never removes or renames an input, an output or the check `baseline / gate`: that is v2, a new tag that consumers
 move to in a pull request.
 
-**Releasing** happens on GitHub: a pull request adds `releases/vX.Y.Z.md` (first line the title, the rest the notes,
-both in Czech; [releases/README.md](../releases/README.md)). The code owner's review covers the change and the release.
-The push of the merge to main starts `release.yml`: it waits until the self-test gate passed on that commit, creates
-the release there and moves `v1`. A pull request without such a file releases nothing; `release=x.y.z` by hand
-releases an existing file at the head of main. Tags are created and moved
+**Releasing** happens on GitHub: a pull request adds or changes `releases/next.md` (first line the title, the rest the
+notes, both in Czech; [releases/README.md](../releases/README.md)). The code owner's review covers the change and the
+release. The push of the merge to main starts `release.yml`: it counts the version from the latest release (the
+commits since then: `feat` → minor, otherwise patch; or `patch:` / `minor:` on the first line; a breaking change is
+v2 and never automatic), waits until the self-test gate passed on that commit, creates the release there and moves
+`v1`. A pull request that does not touch the file releases nothing. Tags are created and moved
 by the GitHub App `expertni-sluzby-baseline-release` (Contents write on this repository only), the bypass actor of the
 rulesets `release-tags-creation` and `major-tags`; its key is a secret of the environment `release` (main only).
 
