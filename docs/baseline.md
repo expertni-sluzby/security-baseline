@@ -54,8 +54,13 @@ Because a v1 release reaches everyone at once, it may:
 It never removes or renames an input, an output or the check `baseline / gate`: that is v2, a new tag that consumers
 move to in a pull request.
 
-**Rollback:** an admin moves `v1` back to the previous release (`git push -f origin <sha>:refs/tags/v1`); consumers get
-the previous version at their next run.
+**Releasing** is `scripts/release.sh release <x.y.z> <notes.md> "<title>"` (an admin; `--dry-run` shows what it would
+do): it checks that the self-test gate of `origin/main` passed and that the version is newer, creates the release,
+moves `v1`, opens the pull request for *Current release* in [consumers.md](consumers.md) and lists the ref every
+consumer calls. `scripts/release.sh status` shows the same without changing anything.
+
+**Rollback:** `scripts/release.sh rollback <x.y.z>` moves `v1` back to that release; consumers get it at their next
+run.
 
 zizmor reports a reusable workflow called by a tag as `unpinned-uses` (high). The baseline drops that one finding for
 its own `.../baseline.yml@vN`; every other unpinned reference stays a finding.
