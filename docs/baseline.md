@@ -47,6 +47,9 @@ baseline, moving a pin or dropping it means updating that list too.
 | `fail-on` | `high` | `high` or `critical` |
 | `baseline-rules` | `report` | how findings of the baseline's own rules count (see *Baseline rules*): `report` lists and annotates them without blocking, `enforce` makes them block like the other findings of their scanner (Semgrep ones with `enforce` at `fail-on`, gitleaks ones on every pull request and push). Any other value fails the gate. |
 | `runs-on` | `"ubuntu-24.04"` | runner of every job as JSON; `'["self-hosted", "linux"]'` runs on the organisation's ARC runners (Ubuntu 24.04, Docker in Docker) instead of paid GitHub-hosted minutes. Missing packages (python3-venv) are installed there; Harden-Runner audits only on GitHub-hosted runners. Only for private repositories: the organisation's runner group refuses public ones, which is right (a fork's pull request would run on our runner), and GitHub-hosted minutes are free for public repositories. |
+| `sast-pull-request` | `diff` | what Semgrep scans on a pull request: `diff` only the files the PR changes, compared with its base, and only findings the PR introduces count; `full` the whole repository at the PR's head (see *SAST scope*) |
+| `sast-push` | `off` | what Semgrep scans on a push: `off` nothing (the scheduled run scans the whole repository and is what DefectDojo records); `full` the whole repository |
+| `sast-jobs` | `2` | Semgrep worker processes (`--jobs`), each about one CPU; without a limit Semgrep starts one per CPU it sees, on a shared runner node all of the node's CPUs |
 
 ## What runs
 
@@ -55,13 +58,14 @@ baseline, moving a pin or dropping it means updating that list too.
 | secrets | gitleaks (the repository's `.gitleaks.toml`, then the baseline's rules), TruffleHog `--only-verified` | PR: the PR's commits · push: the pushed commits · schedule/dispatch: full history | **always** on PR/push; full-history hits are warnings; baseline-rule hits only with `baseline-rules: enforce` |
 | dependencies | osv-scanner | all lockfiles, recursive; a root `osv-scanner.toml` applies to all of them | with `enforce`: CVSS ≥ 7 (≥ 9 for `critical`) |
 | iac | Trivy `config` | Dockerfile, Helm, Kubernetes, Terraform | with `enforce`: HIGH/CRITICAL |
-| sast | Semgrep `p/default` + the baseline's rules | whole repo, `.semgrepignore` respected | with `enforce`: ERROR/HIGH/CRITICAL; baseline-rule hits only with `baseline-rules: enforce` too |
+| sast | Semgrep `p/default` + the baseline's rules | PR: the changed files against the base, new findings (`sast-pull-request: diff`) · push: nothing (`sast-push: off`) · schedule/dispatch: whole repo; `.semgrepignore` respected | with `enforce`: ERROR/HIGH/CRITICAL; baseline-rule hits only with `baseline-rules: enforce` too |
 | workflows | zizmor | `.github/workflows/**` | with `enforce`: high |
 | defectdojo | `reimport-scan` | not on pull requests | — (fails red if DefectDojo rejects an upload) |
 | gate | — | — | the one check to require; names what blocked, where the full list is and what to do (see *Reading a failed run*); a scanner job that did not finish fails it |
 
 Each push / scheduled run updates one DefectDojo engagement per branch (`ci/<branch>`), one
-test per tool; findings missing from a later run are closed. Secret findings are the exception:
+test per tool; findings missing from a later run are closed. A run without a Semgrep report (a push with
+`sast-push: off`) leaves the Semgrep test as it is; the scheduled run updates it. Secret findings are the exception:
 a push scans only the pushed commits, so its upload adds and reopens secret findings but never
 closes one; only a full-history scan (schedule, dispatch, a push without a usable base) closes
 them.
@@ -114,8 +118,8 @@ or list the path in `.semgrepignore`.
 
 ### Rollout of a new rule
 
-On a pull request the scanners look at the whole repository, so a new rule would block every pull request of a
-consumer with an old finding of its kind until that finding is fixed. Therefore:
+On a pull request the scanners look at the whole repository (Semgrep only with `sast-pull-request: full`), so a new
+rule would block every pull request of a consumer with an old finding of its kind until that finding is fixed. Therefore:
 
 1. A release that adds rules is a minor bump (PLAN.md §6.6) and changes no consumer by itself: each consumer pins a
    commit and moves the pin in a pull request, which runs the new rules and shows their findings before anything is
@@ -137,6 +141,23 @@ gitleaks over `tests/gitleaks/src`, whose findings must be exactly the `file:lin
 The self-test runs with `baseline-rules: enforce`, so this repository is held to its own rules. A rule added here
 comes with its fixtures, and spells what it looks for so that its own rule file does not match it.
 
+### SAST scope
+
+Semgrep is the heaviest scanner: a scan of the whole repository takes minutes and one CPU per worker, and every
+consumer's pull requests run it on the same shared runners. So by default:
+
+- **Pull request** (`sast-pull-request: diff`): Semgrep scans only the files the pull request changes against its base
+  (the first parent of GitHub's merge commit, `semgrep --baseline-commit`) and reports only the findings that the base
+  does not have. A pull request that changes only documentation scans nothing. A finding that predates the pull request
+  does not block it; the scheduled run reports it. `full` scans the whole repository at the head, as before v1.2.0.
+- **Push** (`sast-push: off`): no Semgrep. `full` scans the whole repository.
+- **Schedule and manual runs**: always the whole repository; these runs are what DefectDojo records. Call the baseline
+  from a `schedule` trigger (as in the example above), otherwise the whole repository is never scanned.
+- `sast-jobs` (2) caps Semgrep's worker processes; each takes about one CPU.
+
+Scans of a pull request that a newer push to it has made obsolete are cancelled (`concurrency`, per job and pull
+request); push, scheduled and manual runs are never cancelled.
+
 ## Reading a failed run
 
 Only the gate turns red; the scanner jobs stay green and carry the detail. Look, in this order, at:
@@ -151,8 +172,8 @@ Only the gate turns red; the scanner jobs stay green and carry the detail. Look,
 3. **The artifacts** `baseline-*`: the raw reports, kept 7 days, for tooling.
 
 On a pull request the scanners look at the whole repository at the PR's head, not only at its
-changes, so a blocking finding may predate the PR: an advisory published yesterday blocks every
-branch today. Fix it in the PR, or merge the fix to the base branch and update the branch
+changes (SAST only at the changes, unless `sast-pull-request` is `full`: *SAST scope*), so a blocking finding may
+predate the PR: an advisory published yesterday blocks every branch today. Fix it in the PR, or merge the fix to the base branch and update the branch
 (gating on new findings only: see *Not yet*).
 
 | Scanner | Fix | Confirmed false positive, accepted risk |
@@ -174,5 +195,6 @@ no `${{ }}` inside `run:`. Reports are artifacts (public on a public repo): gitl
 ## Not yet (v1.x)
 
 More of our own rules (PLAN.md §7.1; the first ones: *Baseline rules*), Trivy image scans, SBOM, gating on *new* findings only
-(today `enforce` blocks on every finding at the threshold — start with `enforce: false`),
+(today `enforce` blocks on every finding at the threshold, Semgrep on pull requests excepted (*SAST scope*) — start with
+`enforce: false`),
 Harden-Runner `block` mode with an egress allowlist.

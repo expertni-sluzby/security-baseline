@@ -21,3 +21,6 @@ jobs:
     with:
       enforce: true
       baseline-rules: enforce
+      # Pull requests scan the changes (the default diff), pushes to main the whole repository: both paths of the
+      # sast job run here.
+      sast-push: full
